@@ -2,7 +2,6 @@ package io.buoyant.grpc.runtime
 
 import com.twitter.finagle.{Failure, Service => FinagleService}
 import com.twitter.finagle.buoyant.h2
-import com.twitter.io.Buf
 import com.twitter.util.{Future, Return, Throw, Try}
 
 object ServerDispatcher {
@@ -76,7 +75,7 @@ object ServerDispatcher {
 
     private[this] def acceptUnary[Req](codec: Codec[Req], req: h2.Request): Future[Req] =
       Codec.bufferWithStatus(req.stream).map {
-        case (buf, _) => codec.decodeBuf(Codec.decodeGrpcFrame(buf))
+        case (buf, _) => codec.decodeByteBuffer(Codec.decodeGrpcFrame(buf))
       }
 
     private[this] def acceptStreaming[Req](codec: Codec[Req], req: h2.Request): Stream[Req] =
@@ -114,24 +113,15 @@ object ServerDispatcher {
               case s: GrpcStatus => s
               case e => GrpcStatus.Internal(e.getMessage)
             }
-            frames.write(status.toTrailers).onSuccess(_ => frames.close())
+            frames.write(status.toTrailers)
         }
 
       val loopF = loop()
 
       // If the client cancels the response, proactively reset the
       // server's stream.
-      frames.onEnd.respond {
-        case Return(_) =>
-          loopF.raise(Failure(GrpcStatus.Ok(), Failure.Interrupted))
-
-        case Throw(e) =>
-          val status = e match {
-            case s: GrpcStatus => s
-            case _ => GrpcStatus.Internal()
-          }
-          msgs.reset(status)
-          loopF.raise(Failure(status, Failure.Interrupted))
+      frames.onCancel.onSuccess { rst =>
+        msgs.reset(rst)
       }
 
       h2.Response(h2.Status.Ok, frames)

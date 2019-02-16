@@ -5,8 +5,7 @@ import com.fasterxml.jackson.annotation._
 import com.fasterxml.jackson.core.{JsonParser, TreeNode}
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.fasterxml.jackson.databind.{DeserializationContext, JsonDeserializer, JsonNode}
-import com.twitter.conversions.storage._
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.buoyant.h2.param._
 import com.twitter.finagle.buoyant.h2.service.H2Classifier
 import com.twitter.finagle.buoyant.h2.{param => h2Param, _}
@@ -15,12 +14,14 @@ import com.twitter.finagle.client.StackClient
 import com.twitter.finagle.filter.DtabStatsFilter
 import com.twitter.finagle.netty4.ssl.server.Netty4ServerEngineFactory
 import com.twitter.finagle.stack.nilStack
+import com.twitter.finagle.tracing.TraceInitializerFilter
 import com.twitter.finagle.{ServiceFactory, Stack, param}
-import com.twitter.util.Monitor
+import com.twitter.logging.Policy
+import com.twitter.util.{Monitor, StorageUnit}
 import io.buoyant.config.PolymorphicConfig
 import io.buoyant.linkerd.protocol.h2._
 import io.buoyant.router.h2.ClassifiedRetries.{BufferSize, ClassificationTimeout}
-import io.buoyant.router.h2.{ClassifiedRetryFilter, DupRequest}
+import io.buoyant.router.h2.{ClassifiedRetryFilter, DupRequest, H2AddForwardedHeader}
 import io.buoyant.router.http.ForwardClientCertFilter
 import io.buoyant.router.{ClassifiedRetries, H2, RoutingFactory}
 import io.netty.handler.ssl.ApplicationProtocolNames
@@ -47,9 +48,10 @@ class H2Initializer extends ProtocolInitializer.Simple {
 
     val clientStack = H2.router.clientStack
       .prepend(h2.H2AccessLogger.module)
-      .replace(H2TraceInitializer.role, H2TraceInitializer.clientModule)
+      .replace(TraceInitializerFilter.role, H2TracePropagatorConfig.clientModule)
       .insertAfter(StackClient.Role.prepConn, LinkerdHeaders.Ctx.clientModule)
       .insertAfter(DtabStatsFilter.role, H2RequestAuthorizerConfig.module)
+      .insertAfter(H2FailureAccrualFactory.role, H2DiagnosticTracer.module)
 
     //  .insertAfter(Retries.Role, http.StatusCodeStatsFilter.module)
 
@@ -63,9 +65,11 @@ class H2Initializer extends ProtocolInitializer.Simple {
 
   protected val defaultServer = {
     val stk = H2.server.stack
-      .replace(H2TraceInitializer.role, H2TraceInitializer.serverModule)
-      .prepend(LinkerdHeaders.Ctx.serverModule)
+      .replace(TraceInitializerFilter.role, H2TracePropagatorConfig.serverModule)
+      //ErrorReseter must precede LinkerdHeaders in order to clear l5d context from responses.
       .prepend(h2.ErrorReseter.module)
+      .prepend(LinkerdHeaders.Ctx.serverModule)
+      .insertBefore(H2AddForwardedHeader.module.role, AddForwardedHeaderConfig.module[Request, Response])
 
     H2.server.withStack(stk)
       .configured(param.Monitor(monitor))
@@ -78,13 +82,20 @@ class H2Initializer extends ProtocolInitializer.Simple {
   }
 
   override def defaultServerPort: Int = 4142
+
+  override protected def configureServer(router: Router, server: Server): Server =
+    super.configureServer(router, server)
+      .configured(router.params[H2TracePropagatorConfig.Param])
 }
 
 object H2Initializer extends H2Initializer
 
 case class H2Config(
-  loggers: Option[Seq[H2RequestAuthorizerConfig]] = None,
-  h2AccessLog: Option[String]
+  h2AccessLog: Option[String],
+  h2AccessLogRollPolicy: Option[String],
+  h2AccessLogAppend: Option[Boolean],
+  h2AccessLogRotateCount: Option[Int],
+  tracePropagator: Option[H2TracePropagatorConfig]
 ) extends RouterConfig {
 
   var client: Option[H2Client] = None
@@ -98,19 +109,13 @@ case class H2Config(
   override val protocol: ProtocolInitializer = H2Initializer
 
   @JsonIgnore
-  private[this] def loggerParam = loggers.map { configs =>
-    val loggerStack =
-      configs.foldRight[Stack[ServiceFactory[Request, Response]]](nilStack) { (config, next) =>
-        config.module.toStack(next)
-      }
-    H2RequestAuthorizerConfig.param.RequestAuthorizer(loggerStack)
-  }
-
-  @JsonIgnore
-  override def routerParams: Stack.Params =
-    (super.routerParams + identifierParam)
-      .maybeWith(h2AccessLog.map(H2AccessLogger.param.File(_)))
-      .maybeWith(loggerParam)
+  override def routerParams(params: Stack.Params): Stack.Params =
+    (super.routerParams(params) + identifierParam)
+      .maybeWith(h2AccessLog.map(H2AccessLogger.param.File.apply))
+      .maybeWith(h2AccessLogRollPolicy.map(Policy.parse _ andThen H2AccessLogger.param.RollPolicy.apply))
+      .maybeWith(h2AccessLogAppend.map(H2AccessLogger.param.Append.apply))
+      .maybeWith(h2AccessLogRotateCount.map(H2AccessLogger.param.RotateCount.apply))
+      .maybeWith(tracePropagator.map(tp => H2TracePropagatorConfig.Param(tp.mk(params))))
 
   private[this] def identifierParam: H2.Identifier = identifier match {
     case None => h2.HeaderTokenIdentifier.param
@@ -133,10 +138,10 @@ trait H2EndpointConfig {
 
   def withEndpointParams(params: Stack.Params): Stack.Params = params
     .maybeWith(windowUpdateRatio.map(r => FlowControl.WindowUpdateRatio(r.toFloat)))
-    .maybeWith(headerTableBytes.map(s => Settings.HeaderTableSize(Some(s.bytes))))
-    .maybeWith(initialStreamWindowBytes.map(s => Settings.InitialStreamWindowSize(Some(s.bytes))))
-    .maybeWith(maxFrameBytes.map(s => Settings.MaxFrameSize(Some(s.bytes))))
-    .maybeWith(maxHeaderListBytes.map(s => Settings.MaxHeaderListSize(Some(s.bytes))))
+    .maybeWith(headerTableBytes.map(s => Settings.HeaderTableSize(Some(StorageUnit.fromBytes(s.toLong)))))
+    .maybeWith(initialStreamWindowBytes.map(s => Settings.InitialStreamWindowSize(Some(StorageUnit.fromBytes(s.toLong)))))
+    .maybeWith(maxFrameBytes.map(s => Settings.MaxFrameSize(Some(StorageUnit.fromBytes(s.toLong)))))
+    .maybeWith(maxHeaderListBytes.map(s => Settings.MaxHeaderListSize(Some(StorageUnit.fromBytes(s.toLong)))))
 }
 
 @JsonTypeInfo(
@@ -160,11 +165,22 @@ class H2PrefixConfig(prefix: PathMatcher) extends PrefixConfig(prefix) with H2Cl
 
 trait H2ClientConfig extends ClientConfig with H2EndpointConfig {
   var forwardClientCert: Option[Boolean] = None
+  var requestAuthorizers: Option[Seq[H2RequestAuthorizerConfig]] = None
 
   @JsonIgnore
   override def params(vars: Map[String, String]): Stack.Params =
     withEndpointParams(super.params(vars))
       .maybeWith(forwardClientCert.map(ForwardClientCertFilter.Enabled))
+      .maybeWith(requestAuthorizerParam)
+
+  @JsonIgnore
+  private[this] def requestAuthorizerParam = requestAuthorizers.map { configs =>
+    val authorizerStack =
+      configs.foldRight[Stack[ServiceFactory[Request, Response]]](nilStack) { (config, next) =>
+        config.module.toStack(next)
+      }
+    H2RequestAuthorizerConfig.param.RequestAuthorizer(authorizerStack)
+  }
 }
 
 @JsonTypeInfo(
@@ -222,7 +238,7 @@ trait H2SvcConfig extends SvcConfig {
   override def params(vars: Map[String, String]): Stack.Params =
     super.params(vars)
       .maybeWith(h2Classifier.map(h2Param.H2Classifier(_)))
-      .maybeWith(classificationTimeoutMs.map { t => ClassificationTimeout(t.millis) })
+      .maybeWith(classificationTimeoutMs.map { t => ClassificationTimeout(t.milliseconds) })
       .maybeWith(retryBufferSize.map(_.param))
 }
 
@@ -239,6 +255,7 @@ case class RetryBufferSize(
 class H2ServerConfig extends ServerConfig with H2EndpointConfig {
 
   var maxConcurrentStreamsPerConnection: Option[Int] = None
+  var addForwardedHeader: Option[AddForwardedHeaderConfig] = None
 
   @JsonIgnore
   override val alpnProtocols: Option[Seq[String]] =
@@ -247,11 +264,12 @@ class H2ServerConfig extends ServerConfig with H2EndpointConfig {
   @JsonIgnore
   override val sslServerEngine = Netty4ServerEngineFactory()
 
-  override def withEndpointParams(params: Stack.Params): Stack.Params = super.withEndpointParams(params)
-    .maybeWith(maxConcurrentStreamsPerConnection.map(c => Settings.MaxConcurrentStreams(Some(c.toLong))))
+  override def withEndpointParams(params: Stack.Params): Stack.Params = (super.withEndpointParams(params)
+    + Settings.MaxConcurrentStreams(maxConcurrentStreamsPerConnection.orElse(Some(1000)).map(_.toLong)))
 
   @JsonIgnore
-  override def serverParams = withEndpointParams(super.serverParams)
+  override def serverParams = withEndpointParams(super.serverParams
+    + AddForwardedHeaderConfig.Param(addForwardedHeader))
 }
 
 abstract class H2IdentifierConfig extends PolymorphicConfig {

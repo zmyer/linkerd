@@ -4,7 +4,7 @@ import sbt.Keys._
 import complete.Parsers.spaceDelimited
 import sbtassembly.AssemblyKeys._
 import sbtassembly.AssemblyPlugin.assemblySettings
-import sbtassembly.MergeStrategy
+import sbtassembly.{AssemblyUtils, MergeStrategy}
 import sbtdocker._
 import sbtdocker.DockerKeys._
 import sbtdocker.DockerSettings.baseDockerSettings
@@ -32,8 +32,9 @@ object Base {
 class Base extends Build {
   import Base._
 
-  val headVersion = "1.3.5"
+  val headVersion = "1.6.1"
   val openJdkVersion = "8u151"
+  val openJ9Version = "jdk8u162-b12_openj9-0.8.0"
 
   object Git {
     def git(arg: String, args: String*) = Process("git" +: arg +: args)
@@ -106,7 +107,15 @@ class Base extends Build {
         Some("snapshots" at nexus + "content/repositories/snapshots")
       else
         Some("releases"  at nexus + "service/local/staging/deploy/maven2")
-    }
+    },
+    mappings in (Compile, packageBin) ~= { (ms: Seq[(File,String)]) => ms filter {
+      case (file,toPath) => {
+        file.getPath match {
+          case nodeModulesRE() => false
+          case _ => true
+        }
+      }
+    }}
   )
 
   val aggregateSettings = Seq(
@@ -133,6 +142,7 @@ class Base extends Build {
        |""".stripMargin.split("\n").toSeq
 
   val nodeModulesRE = ".*/node_modules/.*".r
+
   val appAssemblySettings = assemblySettings ++ Seq(
     assemblyExecScript := defaultExecScript,
     assemblyOption in assembly := (assemblyOption in assembly).value.copy(
@@ -256,11 +266,18 @@ class Base extends Build {
 
     /** Enable the test config for a project with basic dependencies */
     def withTests(): Project = project.dependsOn(testUtil % Test)
+    .settings(inConfig(Test)(Defaults.testSettings ++ Seq(
+      fork := true,
+      baseDirectory := new File(".")
+    )))
 
     /** Enables e2e test config for a project with basic dependencies */
     def withE2e(): Project = project
       .configs(EndToEndTest)
-      .settings(inConfig(EndToEndTest)(Defaults.testSettings ++ ScoverageSbtPlugin.projectSettings))
+      .settings(inConfig(EndToEndTest)(Defaults.testSettings ++ ScoverageSbtPlugin.projectSettings ++ Seq(
+        fork := true,
+        baseDirectory := new File(".")
+      )))
       .settings(libraryDependencies += "org.scoverage" %% "scalac-scoverage-runtime" % "1.3.0" % EndToEndTest)
       .dependsOn(testUtil % EndToEndTest)
 

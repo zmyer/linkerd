@@ -8,6 +8,8 @@ import com.twitter.finagle.param
 import io.buoyant.namerd._
 import java.net.{InetAddress, InetSocketAddress}
 
+import com.twitter.finagle.tracing.NullTracer
+
 class HttpControlServiceConfig extends InterpreterInterfaceConfig {
   @JsonIgnore override protected def mk(
     delegate: Ns => NameInterpreter,
@@ -20,8 +22,8 @@ class HttpControlServiceConfig extends InterpreterInterfaceConfig {
       tlsParams +
         param.Stats(stats.scope(HttpControlServiceConfig.kind)) +
         param.Label(HttpControlServiceConfig.kind) +
-        Http.Netty4Impl
-
+        Http.Netty4Impl ++
+        socketOptParams
     HttpControlServable(addr, iface, params)
   }
 
@@ -40,9 +42,9 @@ case class HttpControlServable(
   params: Stack.Params
 ) extends Servable {
   def kind = HttpControlServiceConfig.kind
-  val http = Http.server
-  def serve(): ListeningServer = http
-    .withParams(http.params ++ params)
+  def serve(): ListeningServer = Http.server
+    .withTracer(NullTracer)
+    .configuredParams(params)
     .withStreaming(true)
     .serve(addr, iface)
 }

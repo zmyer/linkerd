@@ -158,7 +158,7 @@ perms | _required_ | A subset of the string "crwda" representing the permissions
 
 kind: `io.l5d.etcd`
 
-Stores the dtab in Etcd.
+Stores the dtab in etcd.
 
 Key | Default Value | Description
 --- | ------------- | -----------
@@ -166,12 +166,16 @@ experimental | _required_ | Because this storage is still considered experimenta
 host | `localhost` | The location of the etcd API.
 port | `2379` | The port used to connect to the etcd API.
 pathPrefix | `/namerd/dtabs` | The key path under which dtabs should be stored.
+tls | no tls | Use TLS encryption for connections to etcd. See [Namer TLS](#namer-tls).
 
 ## Consul
 
 kind: `io.l5d.consul`
 
 Stores the dtab in Consul KV storage.
+
+The current state of Consul stored dtabs can be viewed at the
+admin endpoint: `/storage/<pathPrefix>.json`.
 
 Key | Default Value | Description
 --- | ------------- | -----------
@@ -184,5 +188,42 @@ readConsistencyMode | `default` | Select between [Consul API consistency modes](
 writeConsistencyMode | `default` | Select between [Consul API consistency modes](https://www.consul.io/docs/agent/http.html) such as `default`, `stale` and `consistent` for writes.
 failFast | `false` | If `false`, disable fail fast and failure accrual for Consul client. Keep it `false` when using a local agent but change it to `true` when talking directly to an HA Consul API.
 backoff |  exponential backoff from 1ms to 1min | Object that determines which backoff algorithm should be used. See [retry backoff](https://linkerd.io/config/head/linkerd#retry-backoff-parameters)
+tls | no tls | Use TLS during connection with Consul. see [Consul Encryption](https://www.consul.io/docs/agent/encryption.html) and [Namer TLS](#namer-tls).
 
+### Namer TLS
 
+> Linkerd supports encrypted communication via TLS to `io.l5d.consul` and `io.l5d.etcd` namer backends.
+
+```yaml
+namers:
+- kind: ...
+  host: ...
+  tls:
+    disableValidation: false
+    commonName: consul.io
+    trustCertsBundle: /certificates/cacert.pem
+    clientAuth:
+      certPath: /certificates/cert.pem
+      keyPath: /certificates/key.pem
+```
+
+A TLS object describes how Linkerd should use TLS when sending requests to Consul agent.
+
+Key               | Default Value                              | Description
+----------------- | ------------------------------------------ | -----------
+disableValidation | false                                      | Enable this to skip hostname validation (unsafe). Setting `disableValidation: true` is incompatible with `clientAuth`.
+commonName        | _required_ unless disableValidation is set | The common name to use for all TLS requests.
+trustCerts        | empty list                                 | A list of file paths of CA certs to use for common name validation (deprecated, please use trustCertsBundle).
+trustCertsBundle  | empty                                      | A file path of CA certs bundle to use for common name validation.
+clientAuth        | none                                       | A client auth object used to sign requests.
+
+If present, a clientAuth object must contain two properties:
+
+Key      | Default Value | Description
+---------|---------------|-------------
+certPath | _required_    | File path to the TLS certificate file.
+keyPath  | _required_    | File path to the TLS key file.  Must be in PKCS#8 format.
+
+<aside class="warning">
+Setting `disableValidation: true` will force the use of the JDK SSL provider which does not support client auth. Therefore, `disableValidation: true` and `clientAuth` are incompatible.
+</aside>

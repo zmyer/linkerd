@@ -1,6 +1,6 @@
 package io.buoyant.namerd.iface
 
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle._
 import com.twitter.finagle.naming.NameInterpreter
 import com.twitter.finagle.stats.NullStatsReceiver
@@ -133,7 +133,7 @@ class ThriftNamerEndToEndTest extends FunSuite with Eventually with IntegrationP
     val tree = await(client.delegate(
       Dtab.read("/host/poop => /srv/woop"),
       Path.read("/svc/poop")
-    ).toFuture)
+    ))
 
     assert(tree ==
       DelegateTree.Delegate(

@@ -1,7 +1,7 @@
 package io.buoyant.linkerd
 package protocol
 
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.http.{Status, Request, Response}
 import com.twitter.finagle.{Failure, Service}
 import io.buoyant.linkerd.tls.TlsUtils._
@@ -52,8 +52,7 @@ class TlsBoundPathTest extends FunSuite with Awaits {
              |    - prefix: "/#/io.l5d.fs/{host}"
              |      tls:
              |        commonName: "{host}.buoyant.io"
-             |        trustCerts:
-             |        - ${certs.caCert.getPath}
+             |        trustCertsBundle: ${certs.caCert.getPath}
              |""".
               stripMargin
           withLinkerdClient(linkerConfig) { client =>
@@ -113,8 +112,7 @@ class TlsBoundPathTest extends FunSuite with Awaits {
             |    - prefix: "/#/io.l5d.fs/bill"
             |      tls:
             |        commonName: "bill.buoyant.io"
-            |        trustCerts:
-            |        - ${certs.caCert.getPath}
+            |        trustCertsBundle: ${certs.caCert.getPath}
             |""".
             stripMargin
           withLinkerdClient(linkerConfig) { client =>
@@ -179,13 +177,11 @@ class TlsBoundPathTest extends FunSuite with Awaits {
             |    - prefix: "/#/io.l5d.fs/bill"
             |      tls:
             |        commonName: excellent
-            |        trustCerts:
-            |        - ${certs.caCert.getPath}
+            |        trustCertsBundle: ${certs.caCert.getPath}
             |    - prefix: "/#/io.l5d.fs/ted"
             |      tls:
             |        commonName: righteous
-            |        trustCerts:
-            |        - ${certs.caCert.getPath}            
+            |        trustCertsBundle: ${certs.caCert.getPath}
             |""".
             stripMargin
           withLinkerdClient(linkerConfig) { client =>
@@ -255,8 +251,7 @@ class TlsBoundPathTest extends FunSuite with Awaits {
              |    - prefix: "/#/io.l5d.fs/{host}"
              |      tls:
              |        commonName: "{host}.buoyant.io"
-             |        trustCerts:
-             |        - ${certs.caCert.getPath}             
+             |        trustCertsBundle: ${certs.caCert.getPath}
              |""".stripMargin
           withLinkerdClient(linkerConfig) { client =>
             val billRsp = {

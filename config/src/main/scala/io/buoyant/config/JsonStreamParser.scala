@@ -5,10 +5,9 @@ import com.fasterxml.jackson.core.`type`.TypeReference
 import com.fasterxml.jackson.databind._
 import com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper
 import com.twitter.concurrent.AsyncStream
-import com.twitter.io.{Buf, Reader}
+import com.twitter.io.{Buf, Reader, StreamTermination}
 import com.twitter.logging.Logger
 import com.twitter.util.{Future, Try}
-
 import scala.util.control.NonFatal
 
 class JsonStreamParser(mapper: ObjectMapper with ScalaObjectMapper) {
@@ -70,19 +69,21 @@ class JsonStreamParser(mapper: ObjectMapper with ScalaObjectMapper) {
     }
   }
 
-  def readStream[T: TypeReference](reader: Reader, bufsize: Int = 8 * 1024): AsyncStream[T] = {
+  def readStream[T: TypeReference](reader: Reader[Buf]): AsyncStream[T] = {
     // Wrap the reader so reads just terminate if a non-fatal exception occurs. This ensures the below AsyncStream ends
     // if reads fail
-    val terminatingReader = new Reader {
-      def read(n: Int): Future[Option[Buf]] = reader.read(n).handle {
+    val terminatingReader = new Reader[Buf] {
+      def read(): Future[Option[Buf]] = reader.read().handle {
         case NonFatal(e) =>
           log.debug(e, "Error reading JSON stream")
           None
       }
       def discard(): Unit = reader.discard()
+
+      def onClose: Future[StreamTermination] = reader.onClose
     }
 
-    AsyncStream.fromReader(terminatingReader, bufsize)
+    Reader.toAsyncStream(terminatingReader)
       .scanLeft[(Seq[T], Buf)]((Nil, Buf.Empty)) {
         case ((_, leftover), chunk) =>
           val b = leftover.concat(chunk)

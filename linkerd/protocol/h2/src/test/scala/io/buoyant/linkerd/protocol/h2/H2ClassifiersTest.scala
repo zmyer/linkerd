@@ -7,7 +7,8 @@ import com.twitter.finagle.util.LoadService
 import com.twitter.finagle.{ChannelClosedException, RequestTimeoutException}
 import com.twitter.util._
 import io.buoyant.config.Parser
-import io.buoyant.linkerd.RouterConfig
+import io.buoyant.linkerd.protocol.h2.grpc.DefaultInitializer
+import io.buoyant.linkerd.{ResponseClassifierInitializer, RouterConfig}
 import io.buoyant.linkerd.protocol.{H2DefaultSvc, H2Initializer}
 import org.scalatest.FunSuite
 
@@ -42,6 +43,8 @@ class H2ClassifiersTest extends FunSuite {
 
   for (
     (classifier, retryMethods) <- Map(
+      new RetryableAll5XXConfig().mk ->
+        Set(Method.Get, Method.Head, Method.Put, Method.Delete, Method.Options, Method.Trace, Method.Post, Method.Patch),
       new RetryableIdempotent5XXConfig().mk ->
         Set(Method.Get, Method.Head, Method.Put, Method.Delete, Method.Options, Method.Trace),
       new RetryableRead5XXConfig().mk ->
@@ -198,13 +201,15 @@ class H2ClassifiersTest extends FunSuite {
     init <- Seq(
       NonRetryable5XXInitializer,
       RetryableIdempotent5XXInitializer,
-      RetryableRead5XXInitializer
+      RetryableAll5XXInitializer,
+      RetryableRead5XXInitializer,
+      DefaultInitializer
     )
   ) {
     val kind = init.configId
 
     test(s"loads $kind") {
-      assert(LoadService[H2ClassifierInitializer]().exists(_.configId == kind))
+      assert(LoadService[ResponseClassifierInitializer]().exists(_.configId == kind))
     }
 
     test(s"parse router with $kind") {

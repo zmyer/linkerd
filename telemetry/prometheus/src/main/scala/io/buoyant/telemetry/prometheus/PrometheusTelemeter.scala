@@ -1,12 +1,13 @@
 package io.buoyant.telemetry.prometheus
 
 import com.twitter.finagle.Service
-import com.twitter.finagle.http.{MediaType, Response, Request}
+import com.twitter.finagle.http.{MediaType, Request, Response}
 import com.twitter.finagle.stats.NullStatsReceiver
+import com.twitter.finagle.stats.buoyant.Metric
 import com.twitter.finagle.tracing.NullTracer
 import com.twitter.util.{Awaitable, Closable, Future}
 import io.buoyant.admin.Admin
-import io.buoyant.telemetry.{Metric, MetricsTree, Telemeter}
+import io.buoyant.telemetry.{MetricsTree, Telemeter}
 
 /**
  * This telemeter exposes metrics data in the Prometheus format, served on
@@ -37,26 +38,38 @@ class PrometheusTelemeter(metrics: MetricsTree, private[prometheus] val handlerP
   private[this] val metricNameDisallowedChars = "[^a-zA-Z0-9:]".r
   private[this] def escapeKey(key: String) = metricNameDisallowedChars.replaceAllIn(key, "_")
 
-  private[this] val labelKeyDisallowedChars = "[^a-zA-Z0-9_]".r
-  private[this] def escapeLabelKey(key: String) = labelKeyDisallowedChars.replaceAllIn(key, "_")
-
   // https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details
   private[this] val labelValDisallowedChars = """(\\|\"|\n)""".r
   private[this] def escapeLabelVal(key: String) = labelValDisallowedChars.replaceAllIn(key, """\\\\""")
 
-  private[this] def formatLabels(labels: Seq[(String, String)]): String =
+  private[this] def formatLabels(labels: Seq[(String, String)], sb: StringBuilder): Unit =
     if (labels.nonEmpty) {
-      labels.map {
-        case (k, v) =>
-          s"""${escapeLabelKey(k)}="${escapeLabelVal(v)}""""
-      }.mkString("{", ", ", "}")
-    } else {
-      ""
+      val lastIndex = labels.size - 1
+      sb.append("{")
+      for (((k, v), i) <- labels.zipWithIndex) {
+        sb.append(k)
+        sb.append("=\"")
+        sb.append(v)
+        sb.append("\"")
+        if (i < lastIndex) sb.append(", ")
+      }
+      sb.append("}")
+      ()
     }
 
   private[this] val first: ((String, String)) => String = _._1
   private[this] def labelExists(labels: Seq[(String, String)], name: String) =
     labels.toIterator.map(first).contains(name)
+
+  private[this] def addException(labels: Seq[(String, String)], name: String) = {
+    val index = labels.map(first).indexOf("exception")
+    if (index == -1) {
+      labels :+ ("exception" -> escapeLabelVal(name))
+    } else {
+      val nested = labels(index)._2
+      labels.updated(index, "exception" -> (nested ++ ":" ++ escapeLabelVal(name)))
+    }
+  }
 
   private[this] def writeMetrics(
     tree: MetricsTree,
@@ -68,15 +81,23 @@ class PrometheusTelemeter(metrics: MetricsTree, private[prometheus] val handlerP
     // Re-write elements out of the prefix into labels
     val (prefix1, labels1) = prefix0 match {
       case Seq("rt", router) if !labelExists(labels0, "rt") =>
-        (Seq("rt"), labels0 :+ ("rt" -> router))
-      case Seq("rt", "service", path) if !labelExists(labels0, "service") =>
-        (Seq("rt", "service"), labels0 :+ ("service" -> path))
-      case Seq("rt", "client", id) if !labelExists(labels0, "client") =>
-        (Seq("rt", "client"), labels0 :+ ("client" -> id))
+        (Seq("rt"), labels0 :+ ("rt" -> escapeLabelVal(router)))
+
+      // Add label for stack { "service", "client", "server" }
+      case Seq("rt", stack, identifier) if Seq("service", "client", "server").contains(stack)
+        && !labelExists(labels0, stack) =>
+        (Seq("rt", stack), labels0 :+ (stack -> escapeLabelVal(identifier)))
+
+      // Handle client service case
       case Seq("rt", "client", "service", path) if !labelExists(labels0, "service") =>
-        (Seq("rt", "client", "service"), labels0 :+ ("service" -> path))
-      case Seq("rt", "server", srv) if !labelExists(labels0, "server") =>
-        (Seq("rt", "server"), labels0 :+ ("server" -> srv))
+        (Seq("rt", "client", "service"), labels0 :+ ("service" -> escapeLabelVal(path)))
+
+      // Add label for exception { "failures", "exn" }
+      case Seq("rt", stack, "failures", exception) if Seq("service", "client", "server").contains(stack) =>
+        (Seq("rt", stack, "failures"), addException(labels0, exception))
+      case Seq("rt", stack, "exn", exception) if Seq("service", "client", "server").contains(stack) =>
+        (Seq("rt", stack, "exceptions"), addException(labels0, exception))
+
       case _ => (prefix0, labels0)
     }
 
@@ -85,19 +106,19 @@ class PrometheusTelemeter(metrics: MetricsTree, private[prometheus] val handlerP
     tree.metric match {
       case c: Metric.Counter =>
         sb.append(key)
-        sb.append(formatLabels(labels1))
+        formatLabels(labels1, sb)
         sb.append(" ")
         sb.append(c.get)
         sb.append("\n")
       case g: Metric.Gauge =>
         sb.append(key)
-        sb.append(formatLabels(labels1))
+        formatLabels(labels1, sb)
         sb.append(" ")
         sb.append(g.get)
         sb.append("\n")
       case s: Metric.Stat =>
         val summary = s.snapshottedSummary
-        if (summary != null) {
+        if (summary != null && summary.count > 0) {
           for (
             (stat, value) <- Seq(
               "count" -> summary.count, "sum" -> summary.sum, "avg" -> summary.avg
@@ -106,7 +127,7 @@ class PrometheusTelemeter(metrics: MetricsTree, private[prometheus] val handlerP
             sb.append(key)
             sb.append("_")
             sb.append(stat)
-            sb.append(formatLabels(labels1))
+            formatLabels(labels1, sb)
             sb.append(" ")
             sb.append(value)
             sb.append("\n")
@@ -120,7 +141,7 @@ class PrometheusTelemeter(metrics: MetricsTree, private[prometheus] val handlerP
             )
           ) {
             sb.append(key)
-            sb.append(formatLabels(labels1 :+ ("quantile" -> percentile)))
+            formatLabels(labels1 :+ ("quantile" -> escapeLabelVal(percentile)), sb)
             sb.append(" ")
             sb.append(value)
             sb.append("\n")

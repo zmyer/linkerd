@@ -1,19 +1,21 @@
 package io.buoyant.admin
 
 import com.twitter.app.{App => TApp}
+import com.twitter.concurrent.NamedPoolThreadFactory
 import com.twitter.finagle._
 import com.twitter.finagle.buoyant._
 import com.twitter.finagle.http.filter.HeadFilter
 import com.twitter.finagle.http.{HttpMuxer, Request, Response}
+import com.twitter.finagle.netty4.param.WorkerPool
 import com.twitter.finagle.netty4.ssl.server.Netty4ServerEngineFactory
-import com.twitter.finagle.stats.NullStatsReceiver
+import com.twitter.finagle.stats.StatsReceiver
 import com.twitter.finagle.tracing.NullTracer
 import com.twitter.logging.Logger
 import com.twitter.server.handler.{SummaryHandler => _, _}
 import com.twitter.server.view.{NotFoundView, TextBlockView}
 import com.twitter.util.Monitor
-import io.buoyant.config.types.Port
-import java.net.{InetSocketAddress, SocketAddress}
+import java.net.InetSocketAddress
+import java.util.concurrent.Executors
 
 object Admin {
   val label = "adminhttp"
@@ -57,13 +59,26 @@ object Admin {
     }
   }
 
-  private def makeServer(tls: Option[TlsServerConfig]) =
+  private def makeServer(
+    tls: Option[TlsServerConfig],
+    workers: Int,
+    socketOptionsParams: Option[SocketOptionsConfig],
+    stats: StatsReceiver
+  ) = {
+
+    val workerPool = new WorkerPool(Executors.newCachedThreadPool(
+      new NamedPoolThreadFactory("admin", makeDaemons = true)
+    ), workers)
+
     Http.server
       .withLabel(label)
       .withMonitor(loggingMonitor)
-      .withStatsReceiver(NullStatsReceiver)
+      .withStatsReceiver(stats)
       .withTracer(NullTracer)
+      .configured(workerPool)
+      .maybeWith(socketOptionsParams.map(_.params))
       .maybeWith(tls.map(_.params(None, Netty4ServerEngineFactory())))
+  }
 
   val threadsJs = "<script src='files/js/threads.js'></script>"
 
@@ -108,11 +123,19 @@ object Admin {
   }
 }
 
-class Admin(val address: InetSocketAddress, tlsCfg: Option[TlsServerConfig]) {
+class Admin(
+  val address: InetSocketAddress,
+  tlsCfg: Option[TlsServerConfig],
+  workers: Int,
+  stats: StatsReceiver,
+  securityConfig: Option[AdminSecurityConfig],
+  socketOptionsConfig: Option[SocketOptionsConfig]
+) {
+
   import Admin._
 
   private[this] val notFoundView = new NotFoundView()
-  private[this] val server = makeServer(tlsCfg)
+  private[this] val server = makeServer(tlsCfg, workers, socketOptionsConfig, stats)
 
   /**
    * Whether or not this admin service was configured to serve over TLS
@@ -131,7 +154,11 @@ class Admin(val address: InetSocketAddress, tlsCfg: Option[TlsServerConfig]) {
         log.debug("admin: %s => %s", url, service.getClass.getName)
         muxer.withHandler(url, service)
     }
-    HeadFilter andThen notFoundView andThen muxer
+    val adminService = HeadFilter andThen notFoundView andThen muxer
+    securityConfig match {
+      case Some(cfg) => cfg.mkFilter andThen adminService
+      case None => adminService
+    }
   }
 
   def serve(app: TApp, extHandlers: Seq[Handler]): ListeningServer =
@@ -140,6 +167,6 @@ class Admin(val address: InetSocketAddress, tlsCfg: Option[TlsServerConfig]) {
   def serveHandler(port: Int, handler: Handler): ListeningServer = {
     val addrWithPort = new InetSocketAddress(address.getAddress, port)
     val muxer = new HttpMuxer().withHandler(handler.url, handler.service)
-    makeServer(tlsCfg).serve(addrWithPort, muxer)
+    makeServer(tlsCfg, workers, socketOptionsConfig, stats).serve(addrWithPort, muxer)
   }
 }

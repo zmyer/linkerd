@@ -2,8 +2,9 @@ package io.buoyant.namer.consul
 
 import com.fasterxml.jackson.annotation.JsonIgnore
 import com.twitter.finagle._
-import com.twitter.finagle.service.Retries
+import com.twitter.finagle.buoyant.TlsClientConfig
 import com.twitter.finagle.tracing.NullTracer
+import com.twitter.conversions.DurationOps._
 import io.buoyant.config.types.Port
 import io.buoyant.consul.utils.RichConsulClient
 import io.buoyant.consul.v1
@@ -30,6 +31,13 @@ import io.buoyant.namer.{NamerConfig, NamerInitializer}
  *   weights:
  *   - tag: primary
  *     weight: 100
+ *   tls:
+ *     disableValidation: false
+ *     commonName: consul.io
+ *     trustCertsBundle: /certificates/cacert.pem
+ *     clientAuth:
+ *       certPath: /certificates/cert.pem
+ *       keyPath: /certificates/key.pem
  * </pre>
  */
 class ConsulInitializer extends NamerInitializer {
@@ -52,7 +60,8 @@ case class ConsulConfig(
   consistencyMode: Option[ConsistencyMode] = None,
   failFast: Option[Boolean] = None,
   preferServiceAddress: Option[Boolean] = None,
-  weights: Option[Seq[TagWeight]] = None
+  weights: Option[Seq[TagWeight]] = None,
+  tls: Option[TlsClientConfig] = None
 ) extends NamerConfig {
 
   @JsonIgnore
@@ -69,17 +78,20 @@ case class ConsulConfig(
    */
   @JsonIgnore
   def newNamer(params: Stack.Params): Namer = {
+
+    // Request timeout used to make sure long-polling requests are never stale.
+    val DefaultRequestTimeout = 10.minutes
+    val tlsParams = tls.map(_.params).getOrElse(Stack.Params.empty)
+
     val service = Http.client
-      // Removes the default client requeues module,
-      // (retries are handled in BaseApi.infiniteRetryFilter)
-      .withStack(Http.client.stack.remove(Retries.Role))
-      .withParams(Http.client.params ++ params)
+      .withParams(Http.client.params ++ tlsParams ++ params)
       .withLabel("client")
       .interceptInterrupts
       .failFast(failFast)
       .setAuthToken(token)
       .ensureHost(host, port)
       .withTracer(NullTracer)
+      .withRequestTimeout(DefaultRequestTimeout)
       .newService(s"/$$/inet/$getHost/$getPort")
 
     val consul = (useHealthCheck, healthStatuses) match {

@@ -2,7 +2,6 @@ package com.twitter.finagle.buoyant.h2
 package netty4
 
 import com.twitter.finagle.buoyant.h2
-import com.twitter.finagle.netty4.ByteBufAsBuf
 import com.twitter.util.{Future, Promise}
 import io.netty.handler.codec.http2._
 import scala.collection.JavaConverters._
@@ -102,7 +101,7 @@ private[h2] object Netty4Message {
 
     def apply(f: Http2DataFrame, updateWindow: Int => Future[Unit]): Frame.Data = {
       val sz = f.content.readableBytes + f.padding
-      val buf = ByteBufAsBuf(f.content.retain())
+
       val releaser: () => Future[Unit] =
         () =>
           {
@@ -115,7 +114,7 @@ private[h2] object Netty4Message {
             f.content.release()
             res
           }
-      Frame.Data(buf, f.isEndStream, releaser)
+      Frame.Data(f.content, f.isEndStream, releaser)
     }
   }
 

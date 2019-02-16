@@ -1,7 +1,7 @@
 package io.buoyant.k8s
 
 import java.net.InetSocketAddress
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.buoyant.ExistentialStability._
 import com.twitter.finagle.service.Backoff
 import com.twitter.finagle.util.DefaultTimer
@@ -34,12 +34,13 @@ class ServiceNamer(
   private[this] val service: (String, String, Option[String]) => Activity[Svc] =
     untupled(Memoize[(String, String, Option[String]), Activity[Svc]] {
       case (nsName, serviceName, labelSelector) =>
-        mkApi(nsName)
+        val instrumentedAct = mkApi(nsName)
           .service(serviceName)
           .activity(
             Svc.fromResponse(nsName, serviceName),
             labelSelector = labelSelector
           ) { case (svc, event) => svc.update(event) }
+        instrumentedAct.underlying
     })
 
   def lookup(path: Path): Activity[NameTree[Name]] =

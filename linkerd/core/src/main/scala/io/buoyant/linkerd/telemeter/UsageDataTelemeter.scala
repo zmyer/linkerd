@@ -8,11 +8,12 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.scala.DefaultScalaModule
 import com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper
 import com.google.protobuf.CodedOutputStream
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle._
 import com.twitter.finagle.http.{MediaType, Method, Request, Response}
 import com.twitter.finagle.service.RetryBudget
 import com.twitter.finagle.stats.NullStatsReceiver
+import com.twitter.finagle.stats.buoyant.Metric
 import com.twitter.finagle.tracing.NullTracer
 import com.twitter.finagle.util.DefaultTimer
 import com.twitter.io.Buf

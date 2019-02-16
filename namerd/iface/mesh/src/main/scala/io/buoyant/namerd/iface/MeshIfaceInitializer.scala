@@ -2,16 +2,15 @@ package io.buoyant.namerd
 package iface
 
 import com.fasterxml.jackson.annotation.JsonIgnore
-import com.twitter.finagle.{Path, Namer, Service, Stack}
+import com.twitter.finagle.{Namer, Path, Stack}
 import com.twitter.finagle.buoyant.H2
-import com.twitter.finagle.naming.NameInterpreter
 import com.twitter.finagle.netty4.ssl.server.Netty4ServerEngineFactory
 import com.twitter.finagle.stats.StatsReceiver
-import com.twitter.util.Duration
-import com.twitter.util.TimeConversions._
 import io.buoyant.grpc.runtime.ServerDispatcher
 import io.netty.handler.ssl.ApplicationProtocolNames
 import java.net.{InetAddress, InetSocketAddress}
+
+import com.twitter.finagle.tracing.NullTracer
 
 class MeshIfaceConfig extends InterfaceConfig {
   @JsonIgnore
@@ -43,8 +42,12 @@ class MeshIfaceConfig extends InterfaceConfig {
         ServerDispatcher(codec, interpreter, delegator, resolver)
       }
 
-      val h2 = H2.server
-      h2.withParams(h2.params ++ tlsParams).withStatsReceiver(stats1).serve(addr, dispatcher)
+      H2.server
+        .withTracer(NullTracer)
+        .configuredParams(tlsParams)
+        .configuredParams(socketOptParams)
+        .withStatsReceiver(stats1)
+        .serve(addr, dispatcher)
     }
   }
 }

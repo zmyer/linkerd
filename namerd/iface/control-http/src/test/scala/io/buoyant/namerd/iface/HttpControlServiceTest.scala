@@ -2,7 +2,7 @@ package io.buoyant.namerd.iface
 
 import java.net.InetSocketAddress
 
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.Name.Bound
 import com.twitter.finagle.http._
 import com.twitter.finagle.naming.NameInterpreter
@@ -22,7 +22,7 @@ class HttpControlServiceTest extends FunSuite with Awaits {
     "tlop" -> Dtab.read("/yeezy => /pablo")
   )
 
-  val v1Stamp = DtabHandler.versionString(InMemoryDtabStore.InitialVersion)
+  val v1Stamp = DtabStore.versionString(InMemoryDtabStore.InitialVersion)
 
   def newDtabStore(dtabs: Map[String, Dtab] = defaultDtabs): DtabStore =
     new InMemoryDtabStore(dtabs)
@@ -36,14 +36,14 @@ class HttpControlServiceTest extends FunSuite with Awaits {
       ConfiguredDtabNamer(dtab, Nil)
     }, Map.empty)
 
-  def readAndAssert(reader: Reader, value: String): Assertion = {
+  def readAndAssert(reader: Reader[Buf], value: String): Assertion = {
     val buf = Buf.Utf8(value)
     readAndAssert(reader, buf)
   }
 
-  def readAndAssert(reader: Reader, value: Buf): Assertion = {
+  def readAndAssert(reader: Reader[Buf], value: Buf): Assertion = {
     val buf = value.concat(HttpControlService.newline)
-    val res = await(reader.read(buf.length)).flatMap(Buf.Utf8.unapply)
+    val res = await(reader.read()).flatMap(Buf.Utf8.unapply)
     assert(res == Some(buf).flatMap(Buf.Utf8.unapply))
   }
 
@@ -387,7 +387,7 @@ class HttpControlServiceTest extends FunSuite with Awaits {
     witness.notify(Throw(new Exception("error")))
     readAndAssert(resp.reader, "error")
 
-    assert(await(resp.reader.read(0)) == None)
+    assert(await(resp.reader.read()) == None)
 
     resp.reader.discard()
   }

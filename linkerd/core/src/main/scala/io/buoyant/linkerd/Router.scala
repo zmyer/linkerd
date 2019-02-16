@@ -1,7 +1,7 @@
 package io.buoyant.linkerd
 
 import com.fasterxml.jackson.annotation.{JsonIgnore, JsonProperty, JsonTypeInfo}
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle._
 import com.twitter.finagle.naming.buoyant.DstBindingFactory
 import com.twitter.finagle.naming.NameInterpreter
@@ -152,7 +152,7 @@ trait RouterConfig {
   def disabled = protocol.experimentalRequired && !_experimentalEnabled.contains(true)
 
   @JsonIgnore
-  def routerParams = (Stack.Params.empty +
+  def routerParams(params: Stack.Params) = (params +
     param.ResponseClassifier(defaultResponseClassifier) +
     FailureAccrualConfig.default)
     .maybeWith(dtab.map(dtab => RoutingFactory.BaseDtab(() => dtab)))
@@ -167,10 +167,10 @@ trait RouterConfig {
 
   @JsonIgnore
   def router(params: Stack.Params): Router = {
-    val prms = params ++ routerParams
+    val prms = params ++ routerParams(params)
     val param.Label(label) = prms[param.Label]
     val announcers = _announcers.toSeq.flatten.map { announcer =>
-      announcer.prefix -> announcer.mk
+      announcer.prefix -> announcer.mk(params)
     }
     protocol.router.configured(prms)
       .serving(servers.map(_.mk(protocol, label)))

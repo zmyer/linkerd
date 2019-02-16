@@ -11,6 +11,7 @@ jobs:
           CI_TERRIBLENESS: 30.seconds
     # Run two containers, $CIRCLE_NODE_TOTAL = 2, $CIRCLE_NODE_INDEX = [0|1]
     parallelism: 2
+    resource_class: large
     working_directory: ~/linkerd
     # All run steps execute in both containers unless otherwise specified.
     # Deploy steps execute on container 0.
@@ -45,7 +46,7 @@ jobs:
           command: |
             set -x
             if [ ! -f docker-17.03.0-ce.tgz ]; then
-              curl -sLO https://get.docker.com/builds/Linux/x86_64/docker-17.03.0-ce.tgz
+              curl -sLO https://download.docker.com/linux/static/stable/x86_64/docker-17.03.0-ce.tgz
             fi
             tar -xz -C /tmp -f docker-17.03.0-ce.tgz
             mv /tmp/docker/* /usr/bin
@@ -66,6 +67,7 @@ jobs:
       - run:
           name: Install sbt dependencies
           command: |
+            apt-get update && apt-get install -y --no-install-recommends git
             sh -x ci/update.sh
 
       # Download and install npm dependencies. They may already be in cache.

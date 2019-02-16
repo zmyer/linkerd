@@ -1,6 +1,6 @@
 package io.buoyant.linkerd.protocol.http
 
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle._
 import com.twitter.finagle.buoyant.linkerd.Headers
 import com.twitter.finagle.http.{Request, Response, Status}
@@ -21,7 +21,7 @@ class ErrorResponderTest extends FunSuite with Awaits {
       rsp
     }
     val stk = ErrorResponder.module.toStack(
-      Stack.Leaf(Stack.Role("endpoint"), ServiceFactory.const(svc))
+      Stack.leaf(Stack.Role("endpoint"), ServiceFactory.const(svc))
     )
     await(stk.make(Stack.Params.empty)())
   }

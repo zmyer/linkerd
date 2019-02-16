@@ -1,14 +1,15 @@
 package io.buoyant.router
 
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle._
 import com.twitter.finagle.buoyant.{Echo => FinagleEcho, _}
 import com.twitter.finagle.client.StackClient
+import com.twitter.finagle.naming.buoyant.RichNoBrokersAvailableException
 import com.twitter.finagle.param.ProtocolLibrary
 import com.twitter.finagle.server.StackServer
 import com.twitter.finagle.stack.nilStack
-import com.twitter.finagle.stats.{NullStatsReceiver, InMemoryStatsReceiver}
-import com.twitter.finagle.tracing.{Annotation, BufferingTracer, Trace, NullTracer}
+import com.twitter.finagle.stats.{InMemoryStatsReceiver, NullStatsReceiver}
+import com.twitter.finagle.tracing.{Annotation, BufferingTracer, NullTracer, Trace}
 import com.twitter.util._
 import io.buoyant.router.RoutingFactory.{IdentifiedRequest, RequestIdentification}
 import io.buoyant.test.Awaits
@@ -212,7 +213,7 @@ object Echo extends Router[String, String] with Server[String, String] {
 
     val client: StackClient[String, String] =
       FinagleEcho.client
-        .transformed(StackRouter.Client.mkStack(_))
+        .withStack(StackRouter.Client.mkStack(_))
 
     val defaultParams: Stack.Params =
       StackClient.defaultParams +
@@ -250,7 +251,7 @@ object Echo extends Router[String, String] with Server[String, String] {
       def make(factory: ServiceFactory[String, String]) = filter andThen factory
       val filter = Filter.mk[String, String, String, String] { (req, svc) =>
         svc(req).handle {
-          case nbae: NoBrokersAvailableException => "NOBROKERS"
+          case nbae: RichNoBrokersAvailableException => "NOBROKERS"
           case e: Throwable => s"ERROR ${e.getMessage}"
         }
       }

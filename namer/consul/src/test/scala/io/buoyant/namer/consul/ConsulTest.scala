@@ -1,11 +1,11 @@
 package io.buoyant.namer.consul
 
 import com.twitter.finagle.Stack
+import com.twitter.finagle.buoyant.{ClientAuth, TlsClientConfig}
 import com.twitter.finagle.util.LoadService
 import io.buoyant.config.Parser
 import io.buoyant.config.types.Port
-import io.buoyant.consul.v1.ConsistencyMode
-import io.buoyant.consul.v1.HealthStatus
+import io.buoyant.consul.v1.{ConsistencyMode, HealthStatus}
 import io.buoyant.namer.{NamerConfig, NamerInitializer}
 import org.scalatest.FunSuite
 
@@ -49,6 +49,13 @@ class ConsulTest extends FunSuite {
                     |weights:
                     | - tag: primary
                     |   weight: 100
+                    |tls:
+                    |  disableValidation: false
+                    |  commonName: consul.io
+                    |  trustCertsBundle: /certificates/cacerts-bundle.pem
+                    |  clientAuth:
+                    |    certPath: /certificates/cert.pem
+                    |    keyPath: /certificates/key.pem
       """.stripMargin
 
     val mapper = Parser.objectMapper(yaml, Iterable(Seq(ConsulInitializer)))
@@ -64,6 +71,9 @@ class ConsulTest extends FunSuite {
     assert(consul.failFast == Some(true))
     assert(consul.preferServiceAddress == Some(false))
     assert(consul.weights == Some(Seq(TagWeight("primary", 100.0))))
+    val clientAuth = ClientAuth("/certificates/cert.pem", None, "/certificates/key.pem")
+    val tlsConfig = TlsClientConfig(None, Some(false), Some("consul.io"), None, Some("/certificates/cacerts-bundle.pem"), Some(clientAuth))
+    assert(consul.tls == Some(tlsConfig))
     assert(!consul.disabled)
   }
 }

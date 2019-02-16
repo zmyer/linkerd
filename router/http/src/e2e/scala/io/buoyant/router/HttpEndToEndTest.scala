@@ -1,6 +1,6 @@
 package io.buoyant.router
 
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.service.Retries
 import com.twitter.finagle.stack.nilStack
 import com.twitter.finagle.http.{Request, Response, Status, Version}
@@ -298,15 +298,14 @@ class HttpEndToEndTest extends FunSuite with Awaits {
       val rsp1 = get()
       assert(err == None)
       assert(rsp1.status == Status.Ok)
-      // downstream connection is reused but upstream is not
-      assert(downstreamCounter("connects") == Some(1))
+      assert(downstreamCounter("connects") == Some(2))
       assert(serverCounter("connects") == Some(2))
 
       retriesToDo = 1
       val rsp2 = get()
       assert(err == None)
       assert(rsp2.status == Status.Ok)
-      assert(downstreamCounter("connects") == Some(1))
+      assert(downstreamCounter("connects") == Some(4))
       assert(serverCounter("connects") == Some(3))
 
     } finally {

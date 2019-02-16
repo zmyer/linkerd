@@ -16,6 +16,8 @@ class ExamplesTest extends FunSuite {
   val mapper = Parser.jsonObjectMapper(Linker.LoadedInitializers.iter)
 
   for (file <- files) {
+    // Example tests are running out of memory in CI and so have been temporarily been disabled to
+    // unblock CI.  This needs to be investigated and fixed.
     test(file.getName) {
       val source = Source.fromFile(file)
       try {

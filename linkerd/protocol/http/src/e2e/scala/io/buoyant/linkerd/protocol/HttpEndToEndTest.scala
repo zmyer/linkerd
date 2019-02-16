@@ -1,24 +1,35 @@
 package io.buoyant.linkerd
 package protocol
 
-import com.twitter.conversions.time._
+import com.twitter.concurrent.AsyncStream
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.{Http => FinagleHttp, Status => _, http => _, _}
 import com.twitter.finagle.buoyant.linkerd.Headers
-import com.twitter.finagle.http.{param => _, _}
 import com.twitter.finagle.http.Method._
+import com.twitter.finagle.http.filter.{ClientDtabContextFilter, ServerDtabContextFilter}
+import com.twitter.finagle.http.{param => _, _}
+import com.twitter.finagle.service.ExpiringService
 import com.twitter.finagle.stats.{InMemoryStatsReceiver, NullStatsReceiver}
 import com.twitter.finagle.tracing.{Annotation, BufferingTracer, NullTracer}
+import com.twitter.io.{Buf, Pipe, Reader}
 import com.twitter.util._
-import io.buoyant.router.{Http, RoutingFactory}
-import io.buoyant.router.http.MethodAndHostIdentifier
-import io.buoyant.test.Awaits
+import io.buoyant.router.StackRouter.Client.PerClientParams
+import io.buoyant.test.{Awaits, BudgetedRetries}
 import java.io.File
 import java.net.InetSocketAddress
 import org.scalatest.{FunSuite, MustMatchers, OptionValues}
+import org.scalatest.tagobjects.Retryable
+import org.scalatest.time.{Millis, Seconds, Span}
 import scala.io.Source
 import scala.util.Random
 
-class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with OptionValues {
+class HttpEndToEndTest
+  extends FunSuite
+    with Awaits
+    with MustMatchers
+    with OptionValues
+    with BudgetedRetries {
+
 
   case class Downstream(name: String, server: ListeningServer) {
     val address = server.boundAddress.asInstanceOf[InetSocketAddress]
@@ -32,7 +43,9 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
   object Downstream {
     def mk(name: String)(f: Request=>Response): Downstream = {
       val service = Service.mk { req: Request => Future(f(req)) }
-      val stack = FinagleHttp.server.stack.remove(Headers.Ctx.serverModule.role)
+      val stack = FinagleHttp.server.stack
+        .remove(Headers.Ctx.serverModule.role)
+        .remove(ServerDtabContextFilter.role)
       val server = FinagleHttp.server.withStack(stack)
         .configured(param.Label(name))
         .configured(param.Tracer(NullTracer))
@@ -52,7 +65,9 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
   def upstream(server: ListeningServer) = {
     val address = Address(server.boundAddress.asInstanceOf[InetSocketAddress])
     val name = Name.Bound(Var.value(Addr.Bound(address)), address)
-    val stack = FinagleHttp.client.stack.remove(Headers.Ctx.clientModule.role)
+    val stack = FinagleHttp.client.stack
+      .remove(Headers.Ctx.clientModule.role)
+      .remove(ClientDtabContextFilter.role)
     FinagleHttp.client.withStack(stack)
       .configured(param.Stats(NullStatsReceiver))
       .configured(param.Tracer(NullTracer))
@@ -69,17 +84,17 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
 
   def annotationKeys(annotations: Seq[Annotation]): Seq[String] =
     annotations.collect {
-      case Annotation.ClientSend() => "cs"
-      case Annotation.ClientRecv() => "cr"
-      case Annotation.ServerSend() => "ss"
-      case Annotation.ServerRecv() => "sr"
+      case Annotation.ClientSend => "cs"
+      case Annotation.ClientRecv => "cr"
+      case Annotation.ServerSend => "ss"
+      case Annotation.ServerRecv => "sr"
       case Annotation.WireSend => "ws"
       case Annotation.WireRecv => "wr"
       case Annotation.BinaryAnnotation(k, _) if k == "l5d.success" => k
       case Annotation.Message(m) if Seq("l5d.retryable", "l5d.failure").contains(m) => m
     }
 
-  test("linking") {
+  test("linking", Retryable) {
     val stats = NullStatsReceiver
     val tracer = new BufferingTracer
     def withAnnotations(f: Seq[Annotation] => Unit): Unit = {
@@ -150,7 +165,7 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
   }
 
 
-  test("marks 5XX as failure by default") {
+  test("marks 5XX as failure by default", Retryable) {
     val stats = new InMemoryStatsReceiver
     val tracer = NullTracer
 
@@ -207,7 +222,7 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
     }
   }
 
-  test("marks exceptions as failure by default") {
+  test("marks exceptions as failure by default", Retryable) {
     val stats = new InMemoryStatsReceiver
     val tracer = NullTracer
 
@@ -232,10 +247,10 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
       val rsp = await(client(req))
       assert(rsp.status == Status.BadGateway)
       assert(stats.counters.get(Seq("rt", "http", "server", "127.0.0.1/0", "requests")) == Some(1))
-      assert(stats.counters.get(Seq("rt", "http", "server", "127.0.0.1/0", "success")) == None)
+      assert(stats.counters.get(Seq("rt", "http", "server", "127.0.0.1/0", "success")).forall(_ == 0))
       assert(stats.counters.get(Seq("rt", "http", "server", "127.0.0.1/0", "failures")) == Some(1))
       assert(stats.counters.get(Seq("rt", "http", "service", "svc/dog", "requests")) == Some(1))
-      assert(stats.counters.get(Seq("rt", "http", "service", "svc/dog", "success")) == None)
+      assert(stats.counters.get(Seq("rt", "http", "service", "svc/dog", "success")).forall(_ == 0))
       assert(stats.counters.get(Seq("rt", "http", "service", "svc/dog", "failures")) == Some(1))
     } finally {
       await(client.close())
@@ -323,19 +338,19 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
         val rsp = await(client(req))
         assert(rsp.status == Status.InternalServerError)
         assert(stats.counters.get(Seq("rt", "http", "server", "127.0.0.1/0", "requests")) == Some(1))
-        assert(stats.counters.get(Seq("rt", "http", "server", "127.0.0.1/0", "success")) == None)
+        assert(stats.counters.get(Seq("rt", "http", "server", "127.0.0.1/0", "success")).forall(_ == 0))
         assert(stats.counters.get(Seq("rt", "http", "server", "127.0.0.1/0", "failures")) == Some(1))
         assert(stats.counters.get(Seq("rt", "http", "client", label, "requests")) == Some(1))
-        assert(stats.counters.get(Seq("rt", "http", "client", label, "success")) == None)
+        assert(stats.counters.get(Seq("rt", "http", "client", label, "success")).forall(_ == 0))
         assert(stats.counters.get(Seq("rt", "http", "client", label, "failures")) == Some(1))
-        assert(stats.counters.get(Seq("rt", "http", "client", label, "status", "200")) == None)
+        assert(stats.counters.get(Seq("rt", "http", "client", label, "status", "200")).forall(_ == 0))
         assert(stats.counters.get(Seq("rt", "http", "client", label, "status", "500")) == Some(1))
         val name = s"svc/dog"
         assert(stats.counters.get(Seq("rt", "http", "service", name, "requests")) == Some(1))
-        assert(stats.counters.get(Seq("rt", "http", "service", name, "success")) == None)
+        assert(stats.counters.get(Seq("rt", "http", "service", name, "success")).forall(_ == 0))
         assert(stats.counters.get(Seq("rt", "http", "service", name, "failures")) == Some(1))
         assert(stats.stats.get(Seq("rt", "http", "service", name, "retries", "per_request")) == Some(Seq(0.0)))
-        assert(!stats.counters.contains(Seq("rt", "http", "service", name, "retries", "total")))
+        assert(stats.counters.get(Seq("rt", "http", "service", name, "retries", "total")).forall(_ == 0))
         withAnnotations { anns =>
           assert(annotationKeys(anns) == Seq("sr", "cs", "ws", "wr", "l5d.failure", "cr", "ss"))
           ()
@@ -349,22 +364,22 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
     }
   }
 
-  test("retries retryableIdempotent5XX") {
+  test("retries retryableIdempotent5XX", Retryable) {
     retryTest("io.l5d.http.retryableIdempotent5XX", idempotentMethods)
   }
 
-  test("retries retryablRead5XX") {
+  test("retries retryablRead5XX", Retryable) {
     retryTest("io.l5d.http.retryableRead5XX", readMethods)
   }
 
-  test("retries nonRetryable5XX") {
+  test("retries nonRetryable5XX", Retryable) {
     retryTest("io.l5d.http.nonRetryable5XX", Set.empty)
   }
 
   val dtabReadHeaders = Seq("l5d-dtab", "l5d-ctx-dtab")
   val dtabWriteHeader = "l5d-ctx-dtab"
 
-  for (readHeader <- dtabReadHeaders) test(s"dtab read from $readHeader header") {
+  for (readHeader <- dtabReadHeaders) test(s"dtab read from $readHeader header", Retryable) {
     val stats = NullStatsReceiver
     val tracer = new BufferingTracer
 
@@ -397,7 +412,7 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
     assert(!headers.contains("dtab-local"))
   }
 
-  test("dtab-local header is ignored") {
+  test("dtab-local header is ignored", Retryable) {
     val stats = NullStatsReceiver
     val tracer = new BufferingTracer
 
@@ -427,7 +442,7 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
     assert(!headers.contains(dtabWriteHeader))
   }
 
-  test("with clearContext") {
+  test("with clearContext", Retryable) {
     val downstream = Downstream.mk("dog") { req =>
       val rsp = Response()
       rsp.contentString = req.headerMap.collect {
@@ -472,7 +487,7 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
     ))
   }
 
-  test("clearContext will remove linkerd error headers and body") {
+  test("clearContext will remove linkerd error headers and body", Retryable) {
     val yaml =
       s"""|routers:
           |- protocol: http
@@ -500,7 +515,38 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
 
   }
 
-  test("timestampHeader adds header") {
+  test("clearContext will remove linkerd error headers and body when identifier is set", Retryable) {
+    val yaml =
+      s"""|routers:
+          |- protocol: http
+          |  dtab: /svc/a/b => /$$/inet/127.1/1234
+          |  identifier:
+          |    kind: io.l5d.path
+          |    segments: 2
+          |  servers:
+          |  - port: 0
+          |    clearContext: true
+          |""".stripMargin
+    val linker = Linker.load(yaml)
+    val router = linker.routers.head.initialize()
+    val s = router.servers.head.serve()
+
+    val req = Request("/a")
+    req.host = "test"
+    val c = upstream(s)
+    try {
+      val resp = await(c(req))
+
+      resp.headerMap.keys must not contain ("l5d-err", "l5d-success-class", "l5d-retryable")
+      resp.contentString must be("")
+    } finally {
+      await(c.close())
+      await(s.close())
+    }
+
+  }
+
+  test("timestampHeader adds header", Retryable) {
     @volatile var headers: Option[HeaderMap] = None
     val downstream = Downstream.mk("test") {
       req =>
@@ -539,7 +585,7 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
     }
   }
 
-  test("no timestampHeader does not add timestamp header") {
+  test("no timestampHeader does not add timestamp header", Retryable) {
     @volatile var headers: Option[HeaderMap] = None
     val downstream = Downstream.mk("test") {
       req =>
@@ -576,7 +622,7 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
     }
   }
 
-  test("without clearContext") {
+  test("without clearContext", Retryable) {
     val downstream = Downstream.mk("dog") { req =>
       val rsp = Response()
       rsp.contentString = req.headerMap.collect {
@@ -623,7 +669,7 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
     assert(headers.get("l5d-ctx-dtab") == Some(localDtab))
   }
 
-  test("logs to correct files") {
+  test("logs to correct files", Retryable) {
     val downstream = Downstream.mk("test") {
       req =>
         val rsp = Response()
@@ -688,5 +734,249 @@ class HttpEndToEndTest extends FunSuite with Awaits with MustMatchers with Optio
       await(downstream.server.close())
       routers.foreach { router => await(router.close()) }
     }
+  }
+
+  test("clientSession idleTimeMs should close client connections") {
+    val config =
+      s"""|routers:
+          |- protocol: http
+          |  experimental: true
+          |  dtab: |
+          |    /p/fox => /$$/inet/127.1/{fox.port} ;
+          |    /svc/century => /p/fox ;
+          |  servers:
+          |  - port: 0
+          |  client:
+          |    clientSession:
+          |      idleTimeMs: 1500
+          |""".stripMargin
+
+    idleTimeMsBaseTest(config){ (router:Router.Initialized, stats:InMemoryStatsReceiver, foxPort:Int) =>
+
+      // Assert
+      def activeConnectionsCount = stats.gauges(Seq("rt", "http", "client", s"$$/inet/127.1/${foxPort}", "connections"))
+
+      // An incoming request through the Http.Router will establish an active connection; We expect to see it here
+      assert(activeConnectionsCount() == 1.0)
+
+      eventually(timeout(Span(5, Seconds)), interval(Span(250, Millis))) {
+        val cnt = activeConnectionsCount()
+        assert(cnt == 0.0)
+      }
+
+      val clientSessionParams = router.params[PerClientParams].paramsFor(Path.read("/svc/century"))[ExpiringService.Param]
+      assert(clientSessionParams.idleTime == 1500.milliseconds)
+      assert(clientSessionParams.lifeTime == Duration.Top)
+
+      ()
+    }
+  }
+
+  test("clientSession idleTimeMs should close client connections for static client") {
+    val config =
+      s"""|routers:
+          |- protocol: http
+          |  experimental: true
+          |  dtab: |
+          |    /p/fox => /$$/inet/127.1/{fox.port} ;
+          |    /svc/century => /p/fox ;
+          |  servers:
+          |  - port: 0
+          |  client:
+          |    kind: io.l5d.static
+          |    configs:
+          |      - prefix: /*
+          |        clientSession:
+          |          idleTimeMs: 1500
+          |""".stripMargin
+
+    idleTimeMsBaseTest(config){ (router:Router.Initialized, stats:InMemoryStatsReceiver, foxPort:Int) =>
+
+      // Assert
+      def activeConnectionsCount = stats.gauges(Seq("rt", "http", "client", s"$$/inet/127.1/${foxPort}", "connections"))
+
+      // An incoming request through the Http.Router will establish an active connection; We expect to see it here
+      assert(activeConnectionsCount() == 1.0)
+
+      eventually(timeout(Span(5, Seconds)), interval(Span(250, Millis))) {
+        val cnt = activeConnectionsCount()
+        assert(cnt == 0.0)
+      }
+
+      val clientSessionParams = router.params[PerClientParams].paramsFor(Path.read("/svc/century"))[ExpiringService.Param]
+      assert(clientSessionParams.idleTime == 1500.milliseconds)
+      assert(clientSessionParams.lifeTime == Duration.Top)
+
+      ()
+    }
+  }
+
+  test("clientSession idleTimeMs should not close client connections when isn't specified") {
+    val config =
+      s"""|routers:
+          |- protocol: http
+          |  experimental: true
+          |  dtab: |
+          |    /p/fox => /$$/inet/127.1/{fox.port} ;
+          |    /svc/century => /p/fox ;
+          |  servers:
+          |  - port: 0
+          |  client:
+          |    forwardClientCert: false
+          |""".stripMargin
+
+    idleTimeMsBaseTest(config){ (router:Router.Initialized, stats:InMemoryStatsReceiver, foxPort:Int) =>
+
+      // Assert
+      def activeConnectionsCount = stats.gauges(Seq("rt", "http", "client", s"$$/inet/127.1/${foxPort}", "connections"))
+
+      // An incoming request through the Http.Router will establish an active connection; We expect to see it here
+      assert(activeConnectionsCount() == 1.0)
+
+      val clientSessionParams = router.params[PerClientParams].paramsFor(Path.read("/svc/century"))[ExpiringService.Param]
+      assert(clientSessionParams.idleTime == Duration.Top)
+      assert(clientSessionParams.lifeTime == Duration.Top)
+
+      ()
+    }
+  }
+
+  test("requests with Max-Forwards header, l5d-add-context and method TRACE are sent downstream") {
+    @volatile var headers: HeaderMap = null
+    @volatile var method: Method = null
+    val downstream = Downstream.mk("dog") { req =>
+      headers = req.headerMap
+      method = req.method
+      val resp = Response()
+      resp.contentString = "response from downstream"
+      resp
+    }
+    val dtab = Dtab.read(s"""
+      /svc/* => /$$/inet/127.1/${downstream.port} ;
+    """)
+
+    val linker = Linker.Initializers(Seq(HttpInitializer)).load(basicConfig(dtab))
+    val router = linker.routers.head.initialize()
+    val server = router.servers.head.serve()
+    val client = upstream(server)
+
+    val req = Request()
+    req.host = "dog"
+    req.headerMap.add("Max-Forwards", "5")
+    req.headerMap.add("l5d-add-context", "true")
+    req.method = Method.Trace
+    val resp = await(client(req))
+    assert(resp.contentString.contains("response from downstream"))
+    assert(headers.contains("Max-Forwards"))
+    assert(headers.contains("l5d-add-context"))
+    assert(method == Method.Trace)
+
+  }
+
+  test("prints out human readable dtab resolution path"){
+    val downstream = Downstream.mk("dog") { req =>
+      Response()
+    }
+
+    val dtab = Dtab.read(s"""
+      /srv => /$$/inet/127.1/${downstream.port};
+      /svc => /srv;
+    """)
+
+    val linker = Linker.Initializers(Seq(HttpInitializer)).load(basicConfig(dtab))
+    val router = linker.routers.head.initialize()
+    val server = router.servers.head.serve()
+    val client = upstream(server)
+
+    val req = Request()
+    req.host = "dog"
+    req.method = Method.Trace
+    req.headerMap.add("Max-Forwards", "5")
+    req.headerMap.add("l5d-add-context", "true")
+    val resp = await(client(req))
+    assert(resp.contentString.contains(
+      s"""|client name: /$$/inet/127.1/${downstream.port}
+          |addresses: [127.0.0.1:${downstream.port}]
+          |selected address: 127.0.0.1:${downstream.port}
+          |dtab resolution:
+          |  /svc/dog
+          |  /srv/dog (/svc=>/srv)
+          |  /$$/inet/127.1/${downstream.port}/dog (/srv=>/$$/inet/127.1/${downstream.port})
+          |""".stripMargin))
+  }
+
+  test("discards content from chunked server response during diagnostic trace"){
+    val responseDiscardedMsg = "Diagnostic trace encountered chunked response. Response content discarded."
+    val downstream = Downstream.mk("dog") { req =>
+      val chunkedWriter = new Pipe[Buf]()
+      AsyncStream[Buf](
+        Seq("Chunked", "Response")
+        .map(Buf.Utf8(_)): _*)
+        .foreachF(chunkedWriter.write)
+        .before(chunkedWriter.close())
+     Response(req.version, Status.Ok, chunkedWriter)
+    }
+
+    val dtab = Dtab.read(s"""
+      /srv => /$$/inet/127.1/${downstream.port};
+      /svc => /srv;
+    """)
+
+    val linker = Linker.Initializers(Seq(HttpInitializer)).load(basicConfig(dtab))
+    val router = linker.routers.head.initialize()
+    val server = router.servers.head.serve()
+    val client = upstream(server)
+
+    val req = Request()
+    req.host = "dog"
+    req.method = Method.Trace
+    req.headerMap.add("Max-Forwards", "5")
+    req.headerMap.add("l5d-add-context", "true")
+    val resp = await(client(req))
+
+    assert(resp.contentString.contains(responseDiscardedMsg))
+  }
+
+  def idleTimeMsBaseTest(config:String)(assertionsF: (Router.Initialized, InMemoryStatsReceiver, Int) => Unit): Unit = {
+    // Arrange
+    val stats = new InMemoryStatsReceiver
+    val fox = Downstream.const("fox", "what does the fox say?")
+
+    val configWithPort = config.replace("{fox.port}", fox.port.toString)
+
+    val linker = Linker.Initializers(Seq(HttpInitializer)).load(configWithPort)
+      .configured(param.Stats(stats))
+
+    val router = linker.routers.head.initialize()
+    val server = router.servers.head.serve()
+
+    val client = upstream(server)
+
+    def get(host: String, path: String = "/")(f: Response => Unit): Unit = {
+      val req = Request(path)
+      req.host = host
+      val rsp = await(client(req))
+      f(rsp)
+    }
+
+    // Act
+    try {
+      get("century") { rsp =>
+        assert(rsp.status == Status.Ok)
+        assert(rsp.contentString == "what does the fox say?")
+        ()
+      }
+
+      // Assert
+      assertionsF(router, stats, fox.port)
+
+    } finally {
+      await(client.close())
+      await(fox.server.close())
+      await(server.close())
+      await(router.close())
+    }
+
+
   }
 }

@@ -19,7 +19,7 @@ These parameters are available to the classifier regardless of kind. Classifiers
 
 Key | Default Value | Description
 --- | ------------- | -----------
-kind | `io.l5d.http.nonRetryable5XX` | Either [`io.l5d.http.nonRetryable5XX`](#non-retryable-5xx), [`io.l5d.h2.nonRetryable5XX`](#non-retryable-5xx), [`io.l5d.http.retryableRead5XX`](#retryable-read-5xx), [`io.l5d.h2.retryableRead5XX`](#retryable-read-5xx), [`io.l5d.http.retryableIdempotent5XX`](#retryable-idempotent-5xx), or [`io.l5d.h2.retryableIdempotent5XX`](#retryable-idempotent-5xx).
+kind | `io.l5d.http.nonRetryable5XX` | Either [`io.l5d.http.nonRetryable5XX`](#non-retryable-5xx), [`io.l5d.h2.nonRetryable5XX`](#non-retryable-5xx), [`io.l5d.http.retryableRead5XX`](#retryable-read-5xx), [`io.l5d.h2.retryableRead5XX`](#retryable-read-5xx), [`io.l5d.http.retryableIdempotent5XX`](#retryable-idempotent-5xx), [`io.l5d.h2.retryableIdempotent5XX`](#retryable-idempotent-5xx), [`io.l5d.http.retryableAll5XX`](#retryable-all-5xx), or [`io.l5d.h2.retryableAll5XX`](#retryable-all-5xx).
 
 
 ## Non-Retryable 5XX
@@ -57,6 +57,19 @@ Like _io.l5d.http.retryableRead5XX_/_io.l5d.h2.retryableRead5XX_, but `PUT` and
 Requests with chunked bodies are NEVER considered to be retryable.
 </aside>
 
+## Retryable All 5XX
+
+kind: `io.l5d.http.retryableAll5XX`
+
+kind: `io.l5d.h2.retryableAll5XX`
+
+Like _io.l5d.http.retryableIdempotent5XX_/_io.l5d.h2.retryableIdempotent5XX_, but `POST` and
+`PATCH` requests may also be retried.
+
+<aside class="warning">
+Requests with chunked bodies are NEVER considered to be retryable.
+</aside>
+
 ## All Successful
 
 kind:  `io.l5d.http.allSuccessful`
@@ -67,7 +80,36 @@ All responses are considered to be successful, regardless of status code.
 
 # gRPC Response Classifiers
 
-For HTTP/2 routers that handle gRPC traffic, four additional response classifiers are available to categorize responses based on [gRPC status codes](https://github.com/grpc/grpc/blob/master/doc/statuscodes.md) in the stream's trailers frame. Status code 0 (`OK`) is always considered successful, while all other gRPC status codes are considered failures.
+For HTTP/2 routers that handle gRPC traffic, one optional parameter and four
+additional response classifiers are available to categorize responses based on
+[gRPC status codes](https://github.com/grpc/grpc/blob/master/doc/statuscodes.md)
+in the stream's trailers frame.
+
+By default, status code 0 (`OK`) is always classified as `Success`, while all
+other gRPC status codes are classified as `Failure`. There exists an optional
+parameter `successStatusCodes` that accepts a user-defined list of gRPC
+status codes that should always be classified as `Success`.
+
+<aside class="notice">
+When defining `successStatusCodes`, it is up to the user to explicity classify
+status code 0 (`OK`) as `Success`.
+</aside>
+
+```yaml
+routers:
+- protocol: h2
+  experimental: true
+  service:
+    responseClassifier:
+      kind: io.l5d.h2.grpc.default
+      successStatusCodes:
+      - 0
+      - 3
+      - 5
+```
+
+Status code 0 (`Ok`), 3 (`InvalidArgument`), and 5 (`NotFound`) will be
+classified as `Success`.
 
 <aside class="notice">
 Since H2 routing is experimental, all gRPC response classifiers are also marked as experimental and require `experimental: true` in the router configuration.
@@ -77,7 +119,17 @@ Since H2 routing is experimental, all gRPC response classifiers are also marked 
 
 kind:  `io.l5d.h2.grpc.default`
 
-Status code 14 (`Unavailable`) is considered retryable, all other errors are non-retryable.
+Only status code 14 (`Unavailable`) is considered retryable, all other errors are non-retryable.
+
+## gRPC Compliant
+
+kind:  `io.l5d.h2.grpc.compliant`
+
+Strictly complies with gRPC specifications for retryability. 
+
+* Status code 14 (`Unavailable`) is considered retryable.
+* HTTP/2 RST_STREAM:REFUSED_STREAM is [considered retryable](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#errors).
+* HTTP/2 429, 502, 503, and 504 responses are [considered retryable](https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md)
 
 ## gRPC Always Retryable
 

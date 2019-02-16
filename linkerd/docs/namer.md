@@ -59,7 +59,7 @@ $ cat config/web
 ```
 
 <aside class="warning">
-Due to the implmentation of file watches in Java, this namer consumes a high
+Due to the implementation of file watches in Java, this namer consumes a high
 amount of CPU and is not suitable for production use.
 </aside>
 
@@ -193,7 +193,10 @@ namers:
      weight: 5.0
 ```
 
-Linkerd provides support for service discovery via [Consul](https://www.consul.io/).
+Linkerd provides support for service discovery via [Consul](https://www.consul.io/). 
+
+The internal state of the Consul namer can be viewed at the
+admin endpoint: `/namer_state/<prefix>.json`.
 
 Key | Default Value | Description
 --- | ------------- | -----------
@@ -209,6 +212,7 @@ consistencyMode | `default` | Select between [Consul API consistency modes](http
 failFast | `false` | If `false`, disable fail fast and failure accrual for Consul client. Keep it `false` when using a local agent but change it to `true` when talking directly to an HA Consul API.
 preferServiceAddress | `true` | If `true` use the service address if defined and default to the node address. If `false` always use the node address.
 weights | none | List of tag-weight configurations, for adjusting the weights of node addresses. When a node matches more than one tag, it gets the highest matching weight. In the absence of match or configuration, nodes get a default weight of `1.0`.
+tls | no tls | Use TLS during connection with Consul. see [Consul Encryption](https://www.consul.io/docs/agent/encryption.html) and [TLS](#consul-tls).
 
 ### Consul Path Parameters
 
@@ -231,6 +235,44 @@ datacenter | yes | The Consul datacenter to use for this request. It can have a 
 tag | yes if includeTag is `true` | The Consul tag to use for this request.
 serviceName | yes | The Consul service name to use for this request.
 
+### Consul TLS
+
+>Linkerd supports encrypted communication via TLS to Consul.
+
+```yaml
+namers:
+- kind: io.l5d.consul
+  host: localhost
+  port: 8500
+  tls:
+    disableValidation: false
+    commonName: consul.io
+    trustCertsBundle: /certificates/cacert.pem
+    clientAuth:
+      certPath: /certificates/cert.pem
+      keyPath: /certificates/key.pem
+```
+
+A TLS object describes how Linkerd should use TLS when sending requests to Consul agent.
+
+Key               | Default Value                              | Description
+----------------- | ------------------------------------------ | -----------
+disableValidation | false                                      | Enable this to skip hostname validation (unsafe). Setting `disableValidation: true` is incompatible with `clientAuth`.
+commonName        | _required_ unless disableValidation is set | The common name to use for all TLS requests.
+trustCerts        | empty list                                 | A list of file paths of CA certs to use for common name validation (deprecated, please use trustCertsBundle).
+trustCertsBundle  | empty                                      | A file path of CA certs bundle to use for common name validation.
+clientAuth        | none                                       | A client auth object used to sign requests.
+
+If present, a clientAuth object must contain two properties:
+
+Key      | Default Value | Description
+---------|---------------|-------------
+certPath | _required_    | File path to the TLS certificate file.
+keyPath  | _required_    | File path to the TLS key file.  Must be in PKCS#8 format.
+
+<aside class="warning">
+Setting `disableValidation: true` will force the use of the JDK SSL provider which does not support client auth. Therefore, `disableValidation: true` and `clientAuth` are incompatible.
+</aside>
 
 <a name="k8s"></a>
 ## Kubernetes service discovery
@@ -257,7 +299,8 @@ dtab: |
 ```
 
 Linkerd provides support for service discovery via
-[Kubernetes](https://k8s.io/).
+[Kubernetes](https://k8s.io/).  The internal state of the Kubernetes namer can be viewed at the
+admin endpoint: `/namer_state/<prefix>.json`.
 
 Key | Default Value | Description
 --- | ------------- | -----------
@@ -456,7 +499,7 @@ port-name | yes | The port name.
 svc-name | yes | The name of the service.
 label-value | yes if `labelSelector` is defined | The label value used to filter services.
 
-### Istio Configuration
+### Istio Configuration (Deprecated)
 
 > Configure an Istio namer
 
@@ -485,7 +528,7 @@ experimental | _required_ | Because this namer is still considered experimental,
 host | `istio-manager.default.svc.cluster.local` | The host of the Istio-Manager.
 port | `8080` | The port of the Istio-Manager.
 
-### Istio Path Parameters
+### Istio Path Parameters (Deprecated)
 
 > Dtab Path Format
 
@@ -769,14 +812,17 @@ dtab: |
 
 A namer that completely rewrites a path.  This is useful for doing arbitrary
 reordering of the path segments that is not possible using standard prefix
-replacement.  While this is a general purpose tool for reordering path
-segments, it cannot be used to modify or split individual segments (for
-modification or splitting of individual segments, see the rewriting namers
-section below).
+replacement. In addition to reordering path segments, this tool can be used
+to modify or split individual segments using regex capture groups.
 
 If the name matches the pattern in the config, it will be replaced by the
 name in the config.  Additionally, any variables in the pattern will capture
 the value of the matching path segment and may be used in the final name.
+
+Note: Pattern matches are greedy.  For example patterns like "{foo}{bar}"
+are ambiguous.  With the capture implementation, {foo} would capture the
+whole segment and {bar} would be empty. Similarly, the pattern "{foo}-{bar}"
+on the segment "a-b-c" would capture "a-b" into foo and "c" into bar.
 
 Key     | Default Value    | Description
 ------- | ---------------- | -----------
@@ -796,6 +842,30 @@ Key    | Required | Description
 ------ | -------- | -----------
 prefix | yes      | Tells Linkerd to resolve the request path using the rewrite namer.
 name   | yes      | Attempt to match this name against the pattern and replace it with the configured name.
+
+## Built-In Namers
+
+The following namers are always available to be used in dtabs. They are prefixed with `/$/` instead
+of `/#/`, and can be used without explicitly adding them to the
+[`namers`](#namers-and-service-discovery) section of the config.
+
+### inet
+
+The inet namer does a DNS lookup for the given hostname and uses the given port.
+
+```
+/$/inet/<hostname>/<port>
+```
+
+### io.buoyant.rinet
+
+The rinet namer is like the inet namer but takes the hostname and port arguments in the reverse
+order.  This is often easier to work with than the inet namer because dtabs can only make prefix
+substitutions and we often wish to use a fixed port while varying the hostname.
+
+```
+/$/io.buoyant.rinet/<port>/<hostname>
+```
 
 <a name="rewritingNamers"></a>
 ## Rewriting Namers

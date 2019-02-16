@@ -6,7 +6,9 @@ namers:
 routers:
 - protocol: http
   httpAccessLog: logs/access.log
-  maxChunkKB: 16
+  httpAccessLogRollPolicy: daily
+  httpAccessLogAppend: true
+  httpAccessLogRotateCount: -1
   maxHeadersKB: 16
   maxInitialLineKB: 16
   maxRequestKB: 102400 # 100MB

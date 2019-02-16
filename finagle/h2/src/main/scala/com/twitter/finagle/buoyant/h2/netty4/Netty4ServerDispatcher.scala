@@ -1,7 +1,7 @@
 package com.twitter.finagle.buoyant.h2
 package netty4
 
-import com.twitter.finagle.{Failure, Service}
+import com.twitter.finagle.{Failure, FailureFlags, Service}
 import com.twitter.finagle.context.{Contexts, RemoteInfo}
 import com.twitter.finagle.stats.StatsReceiver
 import com.twitter.finagle.transport.Transport
@@ -40,7 +40,7 @@ class Netty4ServerDispatcher(
     s"S L:${transport.context.localAddress} R:${transport.context.remoteAddress}"
   private[this] val streamStats = new Netty4StreamTransport.StatsReceiver(stats)
 
-  transport.context.onClose.onSuccess(onTransportClose)
+  transport.onClose.onSuccess(onTransportClose)
 
   override def close(deadline: Time): Future[Unit] = {
     streamsGauge.remove()
@@ -98,17 +98,17 @@ class Netty4ServerDispatcher(
       case ServiceException(e) =>
         val rst = e match {
           case rst: Reset => rst
-          case f@Failure(_) if f.isFlagged(Failure.Interrupted) =>
+          case f@Failure(_) if f.isFlagged(FailureFlags.Interrupted) =>
             log.info(f, "[%s S:%d] interrupted; resetting remote: CANCEL", prefix, st.streamId)
             Reset.Cancel
-          case f@Failure(_) if f.isFlagged(Failure.Rejected) =>
+          case f@Failure(_) if f.isFlagged(FailureFlags.Rejected) =>
             log.info(f, "[%s S:%d] rejected; resetting remote: REFUSED", prefix, st.streamId)
             Reset.Refused
           case e =>
             log.info(e, "[%s S:%d] unexpected error; resetting remote: INTERNAL_ERROR", prefix, st.streamId)
             Reset.InternalError
         }
-        st.localReset(rst)
+        st.reset(rst, local = true); ()
 
       case e =>
         log.error(e, "[%s S:%d] ignoring exception", prefix, st.streamId)
@@ -123,14 +123,17 @@ class Netty4ServerDispatcher(
    * unexpected frame.  Unexpected frames cause the
    * connection to be closed with a protocol error.
    */
-  override protected[this] def demuxNewStream(f: Http2StreamFrame): Future[Unit] = f match {
+  override protected[this] def demuxNewStream(f: Http2Frame): Future[Unit] = f match {
     case frame: Http2HeadersFrame =>
-      val st = newStreamTransport(frame.streamId)
+      val st = newStreamTransport(frame.stream.id)
       if (st.recv(frame)) serveStream(st)
       Future.Unit
 
+    case settingsFrame: Http2SettingsFrame =>
+      transport.write(settingsFrame)
+
     case frame =>
-      log.error("[%s S:%d] unexpected %s; sending GO_AWAY", prefix, frame.streamId, frame.name)
+      log.error("[%s S:%s] unexpected %s frame; sending GO_AWAY", prefix, frame, frame.name)
       val e = new IllegalArgumentException(s"unexpected frame on new stream: ${frame.name}")
       goAway(GoAway.ProtocolError).before(Future.exception(e))
   }

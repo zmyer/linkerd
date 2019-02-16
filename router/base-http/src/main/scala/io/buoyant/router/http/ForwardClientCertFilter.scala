@@ -13,13 +13,14 @@ class ForwardClientCertFilter[Req, H: HeadersLike, Rep](implicit requestLike: Re
   val GeneralNameTypeUri = 6
   val GeneralNameTypeDns = 2
 
-  val digest: MessageDigest = MessageDigest.getInstance("SHA-256")
+  // MessageDigest is not thread-safe, so using ThreadLocal to avoid concurrency issues.
+  val digest = ThreadLocal.withInitial[MessageDigest](() => MessageDigest.getInstance("SHA-256"));
 
   def apply(req: Req, svc: Service[Req, Rep]): Future[Rep] = {
     Transport.peerCertificate.foreach(clientCert => {
       val clientCertHeader = new mutable.StringBuilder(128)
 
-      clientCertHeader ++= s"Hash=${printHexBinary(digest.digest(clientCert.getEncoded))}"
+      clientCertHeader ++= s"Hash=${printHexBinary(digest.get().digest(clientCert.getEncoded))}"
 
       clientCert match {
         case x509ClientCert: X509Certificate =>
@@ -33,6 +34,7 @@ class ForwardClientCertFilter[Req, H: HeadersLike, Rep](implicit requestLike: Re
               nameType match {
                 case GeneralNameTypeUri => clientCertHeader ++= s";SAN=$nameValue" // Use "SAN:" instead of "URI:" for backward compatibility with previous releases.
                 case GeneralNameTypeDns => clientCertHeader ++= s";DNS=$nameValue"
+                case _ =>
               }
             }
           }
@@ -45,13 +47,23 @@ class ForwardClientCertFilter[Req, H: HeadersLike, Rep](implicit requestLike: Re
       }
 
       val headersLike = implicitly[HeadersLike[H]]
-      headersLike.set(requestLike.headers(req), "x-forwarded-client-cert", clientCertHeader.result)
+      headersLike.set(requestLike.headers(req), ForwardClientCertFilter.Header, clientCertHeader.result)
     })
     svc(req)
   }
 }
 
+class ClearForwardedClientCertFilter[Req, H: HeadersLike, Rep](implicit requestLike: RequestLike[Req, H]) extends SimpleFilter[Req, Rep] {
+  override def apply(req: Req, svc: Service[Req, Rep]): Future[Rep] = {
+    val headersLike = implicitly[HeadersLike[H]]
+    headersLike.remove(requestLike.headers(req), ForwardClientCertFilter.Header)
+    svc(req)
+  }
+}
+
 object ForwardClientCertFilter {
+
+  val Header = "x-forwarded-client-cert"
 
   case class Enabled(enabled: Boolean)
   implicit object Param extends Stack.Param[Enabled] {
@@ -66,8 +78,7 @@ object ForwardClientCertFilter {
       val description = "Adds a 'x-forwarded-client-cert' header to requests as they are received"
       def make(_param: Enabled, next: ServiceFactory[Req, Rep]) = {
         if (_param.enabled) new ForwardClientCertFilter().andThen(next)
-        else next
+        else new ClearForwardedClientCertFilter().andThen(next)
       }
     }
 }
-

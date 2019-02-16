@@ -1,15 +1,25 @@
 package io.buoyant.grpc.runtime
 
 import com.twitter.concurrent.{AsyncMutex, AsyncQueue}
-import com.twitter.finagle.Failure
-import com.twitter.finagle.buoyant.h2
-import com.twitter.io.Buf
-import com.twitter.util.{Activity, Event, Future, Promise, Return, Throw, Try, Var}
+import com.twitter.finagle.{Failure, FailureFlags}
+import com.twitter.finagle.buoyant.h2.Reset
+import com.twitter.util._
 
 trait Stream[+T] {
+  /**
+   * Consumers of a Stream should call recv() to poll messages off of the Stream.  Each message is
+   * wrapped in a Releasable which provides a release function.  Consumers must call the release
+   * function of each message once they are done with it.  If the stream has terminated gracefully,
+   * this will return a Future.Exception[GrpcStatus].
+   */
   def recv(): Future[Stream.Releasable[T]]
 
-  def reset(err: GrpcStatus): Unit
+  /**
+   * Reset the underlying H2 stream.  This should be called by the consumer of this stream when
+   * they no longer want to receive messages.  This uses an H2 stream reset to signal to the
+   * producer to stop producing.
+   */
+  def reset(err: Reset): Unit
 }
 
 object Stream {
@@ -19,11 +29,25 @@ object Stream {
 
   trait Provider[-T] {
     def send(t: T): Future[Unit]
-    def close(): Future[Unit]
+    def close(grpcStatus: GrpcStatus = GrpcStatus.Ok()): Future[Unit]
+  }
+
+  private def failAndDrainQueue[T](q: AsyncQueue[Releasable[T]], e: Throwable): Unit = {
+    q.fail(e, discard = false)
+    def drain(q: AsyncQueue[Releasable[T]]): Future[Nothing] = {
+      q.poll().flatMap { t =>
+        t.release()
+        drain(q)
+      }
+    }
+    drain(q)
+    ()
   }
 
   def fromQueue[T](q: AsyncQueue[Releasable[T]]): Stream[T] = new Stream[T] {
-    override def reset(rst: GrpcStatus): Unit = q.fail(rst, discard = true)
+    override def reset(err: Reset): Unit = {
+      failAndDrainQueue(q, err)
+    }
     override def recv(): Future[Releasable[T]] = q.poll()
   }
 
@@ -39,15 +63,15 @@ object Stream {
   def exception[T](e: Throwable): Stream[T] = new Stream[T] {
     val eF = Future.exception(e)
     override def recv(): Future[Releasable[T]] = eF
-    override def reset(rst: GrpcStatus): Unit = ()
+    override def reset(err: Reset): Unit = ()
   }
 
   def mk[T]: Stream[T] with Provider[T] = new Stream[T] with Provider[T] {
     // TODO bound queue? not strictly necessary if send() future observed...
     private[this] val q = new AsyncQueue[Releasable[T]]
 
-    override def reset(e: GrpcStatus): Unit = {
-      q.fail(e, discard = true)
+    override def reset(e: Reset): Unit = {
+      failAndDrainQueue(q, e)
     }
 
     override def recv(): Future[Releasable[T]] = q.poll()
@@ -59,17 +83,17 @@ object Stream {
         Future.Unit
       }
       if (q.offer(Releasable(msg, release))) p
-      else Future.exception(Failure("rejected", Failure.Rejected))
+      else Future.exception(Failure("rejected", FailureFlags.Rejected))
     }
 
-    override def close(): Future[Unit] = {
-      q.fail(GrpcStatus.Ok(), discard = false)
+    override def close(grpcStatus: GrpcStatus = GrpcStatus.Ok()): Future[Unit] = {
+      q.fail(grpcStatus, discard = false)
       Future.Unit
     }
   }
 
   def empty(status: GrpcStatus): Stream[Nothing] = new Stream[Nothing] {
-    override def reset(e: GrpcStatus): Unit = ()
+    override def reset(e: Reset): Unit = ()
     override def recv(): Future[Releasable[Nothing]] = Future.exception(status)
   }
 
@@ -102,11 +126,15 @@ object Stream {
       private[this] var streamRef: Either[Future[Stream[T]], Try[Stream[T]]] =
         Left(streamFut)
 
-      def reset(e: GrpcStatus): Unit = synchronized {
+      def reset(e: Reset): Unit = synchronized {
         streamRef match {
-          case Right(_) =>
+          case Right(Return(s)) => s.reset(e)
+          case Right(Throw(_)) => // Do nothing.
           case Left(f) =>
-            f.raise(Failure(e, Failure.Interrupted))
+            f.raise(Failure(e, FailureFlags.Interrupted))
+            // Interrupting a Future does not guarantee that it will fail.  If the stream future
+            // does succeed, we should reset that stream.
+            f.onSuccess(_.reset(e))
         }
         streamRef = Right(Throw(e))
       }
@@ -125,16 +153,15 @@ object Stream {
         val p = new Promise[Stream.Releasable[T]] with Promise.InterruptHandler {
           override protected def onInterrupt(t: Throwable): Unit =
             t match {
-              case e@Failure(cause) if e.isFlagged(Failure.Interrupted) =>
+              case e@Failure(cause) if e.isFlagged(FailureFlags.Interrupted) =>
                 val status = cause match {
-                  case Some(s: GrpcStatus) => s
-                  case Some(e) => GrpcStatus.Canceled(e.getMessage)
-                  case None => GrpcStatus.Canceled()
+                  case Some(e: Reset) => e
+                  case _ => Reset.Cancel
                 }
                 reset(status)
                 f.raise(e)
               case _ =>
-                reset(GrpcStatus.Canceled(t.getMessage))
+                reset(Reset.Cancel)
                 f.raise(t)
             }
         }
@@ -160,5 +187,7 @@ object Stream {
         }
       }
     }
+
+  def fromFuture[T](fut: Future[T]): Stream[T] = deferred(fut.map(value))
 
 }

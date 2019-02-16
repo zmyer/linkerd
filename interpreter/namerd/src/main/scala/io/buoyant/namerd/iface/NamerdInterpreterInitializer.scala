@@ -2,7 +2,7 @@ package io.buoyant.namerd.iface
 
 import com.fasterxml.jackson.annotation.JsonIgnore
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle._
 import com.twitter.finagle.buoyant.TlsClientConfig
 import com.twitter.finagle.liveness.FailureDetector
@@ -11,7 +11,7 @@ import com.twitter.finagle.naming.NameInterpreter
 import com.twitter.finagle.param.Label
 import com.twitter.finagle.service._
 import com.twitter.logging.Logger
-import com.twitter.util.{NonFatal => _, _}
+import com.twitter.util._
 import io.buoyant.admin.Admin
 import io.buoyant.admin.Admin.{Handler, NavItem}
 import io.buoyant.namer.{InterpreterInitializer, NamespacedInterpreterConfig}
@@ -42,6 +42,7 @@ case class Retry(
 case class ClientTlsConfig(commonName: String, caCert: Option[String]) {
   def params: Stack.Params = {
     TlsClientConfig(
+      enabled = Some(true),
       disableValidation = Some(false),
       commonName = Some(commonName),
       trustCerts = caCert.map(Seq(_)),
@@ -52,16 +53,12 @@ case class ClientTlsConfig(commonName: String, caCert: Option[String]) {
 
 case class FailureThresholdConfig(
   minPeriodMs: Option[Int],
-  @JsonDeserialize(contentAs = classOf[java.lang.Double]) threshold: Option[Double],
-  windowSize: Option[Int],
   closeTimeoutMs: Option[Int]
 ) {
   @JsonIgnore
   def params: Stack.Params = {
     val thresholdConfig = ThresholdConfig(
       minPeriodMs.map(_.milliseconds).getOrElse(FailureThresholdConfig.DefaultMinPeriod),
-      threshold.getOrElse(FailureThresholdConfig.DefaultThreshold),
-      windowSize.getOrElse(FailureThresholdConfig.DefaultWindowSize),
       closeTimeoutMs.map(_.milliseconds).getOrElse(FailureThresholdConfig.DefaultCloseTimeout)
     )
     StackParams.empty + FailureDetector.Param(thresholdConfig)
@@ -98,7 +95,7 @@ case class NamerdInterpreterConfig(
     val backoffs = Backoff.exponentialJittered(baseRetry.seconds, maxRetry.seconds)
 
     val monitor = Monitor.mk {
-      case e: Failure if e.isFlagged(Failure.Interrupted) => true
+      case e: Failure if e.isFlagged(FailureFlags.Interrupted) => true
     }
 
     val param.Stats(stats0) = params[param.Stats]
@@ -114,19 +111,12 @@ case class NamerdInterpreterConfig(
       .withSessionQualifier.noFailFast
       .withSessionQualifier.noFailureAccrual
 
-    val iface = client.newIface[thrift.Namer.FutureIface](name, label)
+    val iface = client.build[thrift.Namer.MethodPerEndpoint](name, label)
 
     val ns = namespace.getOrElse("default")
     val Label(routerLabel) = params[Label]
 
-    new ThriftNamerClient(iface, ns, backoffs, stats) with Admin.WithHandlers with Admin.WithNavItems {
-      val handler = new NamerdHandler(Seq(routerLabel -> config), Map(routerLabel -> this))
-
-      override def adminHandlers: Seq[Handler] =
-        Seq(Handler("/namerd", handler, css = Seq("delegator.css")))
-
-      override def navItems: Seq[NavItem] = Seq(NavItem("namerd", "namerd"))
-    }
+    new ThriftNamerClient(iface, ns, backoffs, stats)
   }
 }
 
@@ -137,14 +127,10 @@ object NamerdInterpreterConfig {
 object FailureThresholdConfig {
 
   val DefaultMinPeriod = 5.seconds
-  val DefaultThreshold = 2.0
-  val DefaultWindowSize = 100
   val DefaultCloseTimeout = 4.seconds
 
   def defaultStackParam = StackParams.empty + FailureDetector.Param(ThresholdConfig(
     DefaultMinPeriod,
-    DefaultThreshold,
-    DefaultWindowSize,
     DefaultCloseTimeout
   ))
 }

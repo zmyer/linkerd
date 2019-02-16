@@ -1,6 +1,6 @@
 package io.buoyant.k8s
 
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle._
 import com.twitter.finagle.http.{Request, Response}
 import com.twitter.io.{Buf, Writer}
@@ -671,7 +671,7 @@ class EndpointsNamerTest extends FunSuite with Awaits {
 
   trait Fixtures {
     @volatile var doInit, didInit, doScaleUp, doScaleDown, doFail, didServices = new Promise[Unit]
-    @volatile var writer: Writer = null
+    @volatile var writer: Writer[Buf] = null
 
     val service = Service.mk[Request, Response] {
       case req if req.uri == "/api/v1/watch/namespaces/srv/endpoints/sessions?resourceVersion=5319582" =>
@@ -1046,7 +1046,7 @@ class EndpointsNamerTest extends FunSuite with Awaits {
 
   test("routes to new endpoints after scale down followed by scale up") {
     // linkerd #1626 reproduction
-    @volatile var writer: Writer = null
+    @volatile var writer: Writer[Buf] = null
 
     val service = Service.mk[Request, Response] {
       case req if req.uri == "/api/v1/namespaces/liza1626/endpoints/world-v1" =>
@@ -1165,20 +1165,22 @@ class EndpointsNamerTest extends FunSuite with Awaits {
     val timer = new MockTimer
     val namer = new MultiNsNamer(Path.read("/test"), None, api.withNamespace, Stream.continually(1.millis))(timer)
 
-    @volatile var state: Activity.State[NameTree[Name]] = Activity.Pending
+    @volatile var state: Set[Address] = Set.empty
 
     val activity = namer.lookup(Path.read("/srv/http/sessions"))
 
-    eventually {
-      val addrs = await(activity.toFuture.map {
-        case NameTree.Leaf(Name.Bound(vaddr)) => vaddr.sample() match {
-          case Addr.Bound(addrs, _) => addrs
-          case a => fail("unexpected Addr type: " + a)
-        }
-      })
+    val closable = activity.values.collect {
+      case Return(NameTree.Leaf(Name.Bound(vaddr))) => vaddr
+    }.mergeMap { vaddr =>
+      vaddr.changes
+    }.respond { addr =>
+      val Addr.Bound(addrs, _) = addr
+      state = addrs
+    }
 
+    eventually {
       assert(
-        addrs == Set(
+        state == Set(
           Address("10.248.4.9", 8083),
           Address("10.248.7.11", 8083),
           Address("10.248.8.9", 8083),
@@ -1186,11 +1188,13 @@ class EndpointsNamerTest extends FunSuite with Awaits {
         )
       )
     }
+
+    closable.close()
   }
 
   test("existing Vars are updated when a service goes away and comes back") {
     // linkerd #1626 reproduction
-    @volatile var writer: Writer = null
+    @volatile var writer: Writer[Buf] = null
 
     val service = Service.mk[Request, Response] {
       case req if req.uri == "/api/v1/namespaces/liza1626/endpoints/world-v1" =>
@@ -1251,7 +1255,7 @@ class EndpointsNamerTest extends FunSuite with Awaits {
   }
 
   test("out of order resource versions ignored") {
-    @volatile var writer: Writer = null
+    @volatile var writer: Writer[Buf] = null
 
     val service = Service.mk[Request, Response] {
       case req if req.uri == "/api/v1/namespaces/liza1626/endpoints/world-v1" =>

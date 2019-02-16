@@ -1,9 +1,9 @@
 package io.buoyant.grpc.runtime
 
-import com.twitter.finagle.{Failure, Service => FinagleService}
 import com.twitter.finagle.buoyant.h2
-import com.twitter.io.Buf
-import com.twitter.util.{Future, Promise, Return, Throw, Try}
+import com.twitter.finagle.{Failure, FailureFlags, Service => FinagleService}
+import com.twitter.util._
+import io.netty.buffer.Unpooled
 
 object ClientDispatcher {
 
@@ -25,29 +25,20 @@ object ClientDispatcher {
           frames.write(frame).before(loop())
 
         case Throw(s@GrpcStatus.Ok(_)) =>
-          frames.write(h2.Frame.Data(Buf.Empty, eos = true))
+          frames.write(h2.Frame.Data(Unpooled.EMPTY_BUFFER, eos = true))
 
         case Throw(s: GrpcStatus) =>
-          frames.reset(s.toReset)
+          frames.cancel(s.toReset)
           Future.exception(s)
 
         case Throw(e) =>
-          frames.reset(h2.Reset.InternalError)
+          frames.cancel(h2.Reset.InternalError)
           Future.exception(e)
       }
 
     loop()
-    frames.onEnd.respond {
-      case Return(_) =>
-        msgs.reset(GrpcStatus.Ok())
-
-      case Throw(e) =>
-        val status = e match {
-          case s: GrpcStatus => s
-          case rst: h2.Reset => GrpcStatus.fromReset(rst)
-          case e => GrpcStatus.Unknown(e.getMessage)
-        }
-        msgs.reset(status)
+    frames.onCancel.onSuccess { rst =>
+      msgs.reset(rst)
     }
 
     h2.Request("http", h2.Method.Post, "", path, frames)
@@ -58,11 +49,11 @@ object ClientDispatcher {
       case Throw(Failure(Some(e))) => Future.exception(e)
       case Throw(e) => Future.exception(e)
       case Return(rsp) =>
-        val f = Codec.bufferGrpcFrame(rsp.stream).map(codec.decodeBuf)
+        val f = Codec.bufferGrpcFrame(rsp.stream).map(codec.decodeByteBuffer)
 
         val p = new Promise[T]
         p.setInterruptHandler {
-          case e@Failure(cause) if e.isFlagged(Failure.Interrupted) =>
+          case e@Failure(cause) if e.isFlagged(FailureFlags.Interrupted) =>
             val rst = cause match {
               case Some(s: GrpcStatus) => s.toReset
               case _ => h2.Reset.Cancel

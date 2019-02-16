@@ -2,6 +2,7 @@ package io.buoyant.namerd.iface
 
 import com.twitter.finagle.Name.Bound
 import com.twitter.finagle._
+import com.twitter.finagle.http.{MediaType, Request, Response}
 import com.twitter.finagle.naming.NameInterpreter
 import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
 import com.twitter.finagle.tracing.Trace
@@ -9,35 +10,45 @@ import com.twitter.finagle.util.DefaultTimer
 import com.twitter.io.Buf
 import com.twitter.logging.Logger
 import com.twitter.util._
-import com.twitter.util.TimeConversions._
-import io.buoyant.namer.{DelegateTree, Delegator, Metadata}
+import io.buoyant.admin.Admin
+import io.buoyant.config.Parser
+import io.buoyant.namer.{DelegateTree, Delegator, InstrumentedActivity, InstrumentedVar, Metadata}
 import io.buoyant.namerd.iface.{thriftscala => thrift}
 import java.net.{InetAddress, InetSocketAddress}
 
 class ThriftNamerClient(
-  client: thrift.Namer.FutureIface,
+  client: thrift.Namer.MethodPerEndpoint,
   namespace: String,
   backoffs: Stream[Duration],
   statsReceiver: StatsReceiver = NullStatsReceiver,
   clientId: Path = Path.empty,
   _timer: Timer = DefaultTimer
-) extends NameInterpreter with Delegator {
+) extends NameInterpreter with Delegator with Admin.WithHandlers {
   import ThriftNamerInterface._
 
   private[this] implicit val log = Logger.get(getClass.getName)
   private[this] implicit val timer = _timer
   private[this] val tclientId = TPath(clientId)
 
-  private[this] val Released = Failure("Released", Failure.Interrupted)
+  private[this] val Released = Failure("Released", FailureFlags.Interrupted)
+
+  private case class InstrumentedBind(
+    act: InstrumentedActivity[NameTree[Name.Bound]],
+    watch: PollState[thrift.BindReq, thrift.Bound]
+  )
+  private case class InstrumentedAddr(
+    act: InstrumentedVar[Addr],
+    watch: PollState[thrift.AddrReq, thrift.Addr]
+  )
 
   /*
    * XXX needs proper eviction, etc
    */
   private[this] val bindCacheMu = new {}
-  private[this] var bindCache = Map.empty[(Dtab, Path), Activity[NameTree[Name.Bound]]]
+  private[this] var bindCache = Map.empty[(Dtab, Path), InstrumentedBind]
 
   private[this] val addrCacheMu = new {}
-  private[this] var addrCache = Map.empty[Path, Var[Addr]]
+  private[this] var addrCache = Map.empty[Path, InstrumentedAddr]
 
   statsReceiver.addGauge("bindcache.size")(bindCache.size)
   statsReceiver.addGauge("addrcache.size")(addrCache.size)
@@ -57,24 +68,26 @@ class ThriftNamerClient(
     val key = (dtab, path)
     bindCacheMu.synchronized {
       bindCache.get(key) match {
-        case Some(act) =>
+        case Some(bind) =>
           Trace.recordBinary("namerd.client/bind.cached", true)
-          act
+          bind.act.underlying
 
         case None =>
           Trace.recordBinary("namerd.client/bind.cached", false)
-          val act = watchName(dtab, path)
-          bindCache += (key -> act)
-          act
+          val bind = watchName(dtab, path)
+          bindCache += (key -> bind)
+          bind.act.underlying
       }
     }
   }
 
-  private[this] def watchName(dtab: Dtab, path: Path): Activity[NameTree[Name.Bound]] = {
+  private[this] def watchName(dtab: Dtab, path: Path): InstrumentedBind = {
     val tdtab = dtab.show
     val tpath = TPath(path)
 
-    val states = Var.async[Activity.State[NameTree[Name.Bound]]](Activity.Pending) { states =>
+    val state = new PollState[thrift.BindReq, thrift.Bound]
+
+    val act = InstrumentedActivity[NameTree[Name.Bound]] { states =>
       @volatile var stopped = false
       @volatile var pending: Future[_] = Future.Unit
 
@@ -83,33 +96,42 @@ class ThriftNamerClient(
         Trace.recordBinary("namerd.client/bind.path", path.show)
 
         val req = thrift.BindReq(tdtab, thrift.NameRef(stamp0, tpath, namespace), tclientId)
-        pending = Trace.letClear(client.bind(req)).respond {
-          case Return(thrift.Bound(stamp1, ttree, _)) =>
-            bindSuccessCounter.incr()
-            states() = Try(mkTree(ttree)) match {
-              case Return(tree) =>
-                Trace.recordBinary("namerd.client/bind.tree", tree.show)
-                Activity.Ok(tree)
-              case Throw(e) =>
-                Trace.recordBinary("namerd.client/bind.err", e.toString)
-                Activity.Failed(e)
-            }
-            loop(stamp1, backoffs0)
+        state.recordApiCall(req)
+        pending = Trace.letClear(client.bind(req)).respond { rep =>
+          state.recordResponse(rep)
+          rep match {
+            case Return(thrift.Bound(stamp1, ttree, _)) =>
+              bindSuccessCounter.incr()
+              states() = Try(mkTree(ttree)) match {
+                case Return(tree) =>
+                  Trace.recordBinary("namerd.client/bind.tree", tree.show)
+                  Activity.Ok(tree)
+                case Throw(e) =>
+                  Trace.recordBinary("namerd.client/bind.err", e.toString)
+                  Activity.Failed(e)
+              }
+              loop(stamp1, backoffs0)
 
-          case Throw(e@thrift.BindFailure(reason, _, _, _)) =>
-            bindFailureCounter.incr()
-            Trace.recordBinary("namerd.client/bind.fail", reason)
-            if (!stopped) {
+            case Throw(e@thrift.BindFailure(reason, _, _, _)) =>
+              bindFailureCounter.incr()
+              Trace.recordBinary("namerd.client/bind.fail", reason)
+              if (!stopped) {
+                val sleep #:: backoffs1 = backoffs0
+                pending = Future.sleep(sleep)
+                  .onSuccess(_ => loop(stamp0, backoffs1))
+              }
+
+            case Throw(e: Failure) if e.isFlagged(FailureFlags.Interrupted) =>
+            // The request has been cancelled.  Do nothing.
+
+            case Throw(e) =>
+              bindFailureCounter.incr()
+              log.error(e, "bind %s", path.show)
+              Trace.recordBinary("namerd.client/bind.exc", e.toString)
               val sleep #:: backoffs1 = backoffs0
-              pending = Future.sleep(sleep).onSuccess(_ => loop(stamp0, backoffs1))
-            }
-
-          case Throw(e) =>
-            bindFailureCounter.incr()
-            log.error(e, "bind %s", path.show)
-            Trace.recordBinary("namerd.client/bind.exc", e.toString)
-            val sleep #:: backoffs1 = backoffs0
-            pending = Future.sleep(sleep).onSuccess(_ => loop(TStamp.empty, backoffs1))
+              pending = Future.sleep(sleep)
+                .onSuccess(_ => loop(TStamp.empty, backoffs1))
+          }
         }
       }
 
@@ -122,7 +144,7 @@ class ThriftNamerClient(
       }
     }
 
-    Activity(states)
+    InstrumentedBind(act, state)
   }
 
   private[this] def mkTree(ttree: thrift.BoundTree): NameTree[Name.Bound] = {
@@ -143,7 +165,7 @@ class ThriftNamerClient(
               addr
           }
         }
-        NameTree.Leaf(Name.Bound(addr, id, residual))
+        NameTree.Leaf(Name.Bound(addr.act.underlying, id, residual))
 
       case thrift.BoundNode.Alt(ids) =>
         val trees = ids.map { id =>
@@ -178,49 +200,65 @@ class ThriftNamerClient(
     (authority ++ nodeName ++ weight).toMap
   }
 
-  private[this] def watchAddr(id: TPath): Var[Addr] = {
+  private[this] def watchAddr(id: TPath): InstrumentedAddr = {
     val idPath = mkPath(id).show
 
-    Var.async[Addr](Addr.Pending) { addr =>
+    val state = new PollState[thrift.AddrReq, thrift.Addr]
+
+    val ivar = InstrumentedVar[Addr](Addr.Pending) { addr =>
       @volatile var stopped = false
       @volatile var pending: Future[_] = Future.Unit
 
       def loop(stamp0: TStamp, backoffs0: Stream[Duration]): Unit = if (!stopped) {
         Trace.recordBinary("namerd.client/addr.path", idPath)
-        val req = thrift.AddrReq(thrift.NameRef(stamp0, id, namespace), tclientId)
-        pending = Trace.letClear(client.addr(req)).respond {
-          case Return(thrift.Addr(stamp1, thrift.AddrVal.Neg(_))) =>
-            addr() = Addr.Neg
-            Trace.record("namerd.client/addr.neg")
-            loop(stamp1, backoffs0)
+        val req = thrift
+          .AddrReq(thrift.NameRef(stamp0, id, namespace), tclientId)
+        state.recordApiCall(req)
+        pending = Trace.letClear(client.addr(req)).respond { rep =>
+          state.recordResponse(rep)
+          rep match {
+            case Return(thrift.Addr(stamp1, thrift.AddrVal.Neg(_))) =>
+              addr() = Addr.Neg
+              Trace.record("namerd.client/addr.neg")
+              loop(stamp1, backoffs0)
 
-          case Return(thrift.Addr(stamp1, thrift.AddrVal.Bound(thrift.BoundAddr(taddrs, boundMeta)))) =>
-            addrSuccessCounter.incr()
-            val addrs = taddrs.map { taddr =>
-              val thrift.TransportAddress(ipbb, port, addressMeta) = taddr
-              val ipBytes = Buf.ByteArray.Owned.extract(Buf.ByteBuffer.Owned(ipbb))
-              val ip = InetAddress.getByAddress(ipBytes)
-              Address.Inet(new InetSocketAddress(ip, port), convertMeta(addressMeta))
-            }
-            // TODO convert metadata
-            Trace.recordBinary("namerd.client/addr.bound", addrs)
-            addr() = Addr.Bound(addrs.toSet[Address], convertMeta(boundMeta))
-            loop(stamp1, backoffs0)
+            case Return(thrift.Addr(stamp1, thrift.AddrVal.Bound(thrift.BoundAddr(taddrs, boundMeta)))) =>
+              addrSuccessCounter.incr()
+              val addrs = taddrs.map { taddr =>
+                val thrift.TransportAddress(ipbb, port, addressMeta) = taddr
+                val ipBytes = Buf.ByteArray.Owned
+                  .extract(Buf.ByteBuffer.Owned(ipbb))
+                val ip = InetAddress.getByAddress(ipBytes)
+                Address.Inet(
+                  new InetSocketAddress(ip, port),
+                  convertMeta(addressMeta)
+                )
+              }
+              // TODO convert metadata
+              Trace.recordBinary("namerd.client/addr.bound", addrs)
+              addr() = Addr.Bound(addrs.toSet[Address], convertMeta(boundMeta))
+              loop(stamp1, backoffs0)
 
-          case Throw(e@thrift.AddrFailure(msg, _, _)) =>
-            addrFailureCounter.incr()
-            Trace.recordBinary("namerd.client/addr.fail", msg)
-            if (!stopped) {
+            case Throw(e@thrift.AddrFailure(msg, _, _)) =>
+              addrFailureCounter.incr()
+              Trace.recordBinary("namerd.client/addr.fail", msg)
+              if (!stopped) {
+                val sleep #:: backoffs1 = backoffs0
+                pending = Future.sleep(sleep)
+                  .onSuccess(_ => loop(stamp0, backoffs1))
+              }
+
+            case Throw(e: Failure) if e.isFlagged(FailureFlags.Interrupted) =>
+            // The request has been cancelled.  Do nothing.
+
+            case Throw(e) =>
+              addrFailureCounter.incr()
+              log.error(e, "addr on %s", idPath)
+              Trace.recordBinary("namerd.client/addr.exc", e.getMessage)
               val sleep #:: backoffs1 = backoffs0
-              pending = Future.sleep(sleep).onSuccess(_ => loop(stamp0, backoffs1))
-            }
-
-          case Throw(e) =>
-            addrFailureCounter.incr()
-            log.error(e, "addr on %s", idPath)
-            Trace.recordBinary("namerd.client/addr.exc", e.getMessage)
-            val sleep #:: backoffs1 = backoffs0
-            pending = Future.sleep(sleep).onSuccess(_ => loop(TStamp.empty, backoffs1))
+              pending = Future.sleep(sleep)
+                .onSuccess(_ => loop(TStamp.empty, backoffs1))
+          }
         }
       }
 
@@ -232,6 +270,7 @@ class ThriftNamerClient(
         Future.Unit
       }
     }
+    InstrumentedAddr(ivar, state)
   }
 
   private[this] def mkDelegateTree(dt: thrift.DelegateTree): DelegateTree[Name.Bound] = {
@@ -264,7 +303,7 @@ class ThriftNamerClient(
                 addr
             }
           }
-          val bound = Name.Bound(addr, id, residual)
+          val bound = Name.Bound(addr.act.underlying, id, residual)
           DelegateTree.Leaf(mkPath(node.path), Dentry.read(node.dentry), bound)
         case thrift.DelegateContents.Alt(children) =>
           val alts = children.map(dt.nodes).map(mk)
@@ -284,7 +323,7 @@ class ThriftNamerClient(
   override def delegate(
     dtab: Dtab,
     tree: NameTree[Name.Path]
-  ): Activity[DelegateTree[Bound]] = {
+  ): Future[DelegateTree[Bound]] = {
     val tdtab = dtab.show
     val (root, nodes, _) = tree match {
       case NameTree.Leaf(n@Name.Path(p)) =>
@@ -293,44 +332,20 @@ class ThriftNamerClient(
     }
     val ttree = thrift.DelegateTree(root, nodes)
 
-    val states = Var.async[Activity.State[DelegateTree[Name.Bound]]](Activity.Pending) { states =>
-      @volatile var stopped = false
-      @volatile var pending: Future[_] = Future.Unit
-
-      def loop(stamp0: TStamp, backoffs0: Stream[Duration]): Unit = if (!stopped) {
-
-        val req = thrift.DelegateReq(tdtab, thrift.Delegation(stamp0, ttree, namespace), tclientId)
-        pending = Trace.letClear(client.delegate(req)).respond {
-          case Return(thrift.Delegation(stamp1, ttree, _)) =>
-            delegateSuccessCounter.incr()
-            states() = Try(mkDelegateTree(ttree)) match {
-              case Return(tree) => Activity.Ok(tree)
-              case Throw(e) => Activity.Failed(e)
-            }
-            loop(stamp1, backoffs0)
-
-          case Throw(e@thrift.DelegationFailure(reason)) =>
-            delegateFailureCounter.incr()
-            log.error("delegation failed: %s", reason)
-            states() = Activity.Failed(e)
-
-          case Throw(e) =>
-            delegateFailureCounter.incr()
-            log.error(e, "delegation failed")
-            val sleep #:: backoffs1 = backoffs0
-            pending = Future.sleep(sleep).onSuccess(_ => loop(TStamp.empty, backoffs1))
-        }
-      }
-
-      loop(TStamp.empty, backoffs)
-      Closable.make { deadline =>
-        stopped = true
-        pending.raise(Released)
-        Future.Unit
-      }
+    val req = thrift.DelegateReq(tdtab, thrift.Delegation(TStamp.empty, ttree, namespace), tclientId)
+    Trace.letClear(client.delegate(req)).transform {
+      case Return(thrift.Delegation(stamp1, ttree, _)) =>
+        delegateSuccessCounter.incr()
+        Future(mkDelegateTree(ttree))
+      case Throw(e@thrift.DelegationFailure(reason)) =>
+        delegateFailureCounter.incr()
+        log.error("delegation failed: %s", reason)
+        Future.exception(e)
+      case Throw(e) =>
+        delegateFailureCounter.incr()
+        log.error(e, "delegation failed")
+        Future.exception(e)
     }
-
-    Activity(states)
   }
 
   override def dtab: Activity[Dtab] = {
@@ -358,6 +373,9 @@ class ThriftNamerClient(
             log.error("dtab %s lookup failed: %s", namespace, reason)
             states() = Activity.Failed(e)
 
+          case Throw(e: Failure) if e.isFlagged(FailureFlags.Interrupted) =>
+          // The request has been cancelled.  Do nothing.
+
           case Throw(e) =>
             dtabFailureCounter.incr()
             log.error(e, "dtab %s lookup failed", namespace)
@@ -376,5 +394,63 @@ class ThriftNamerClient(
     }
 
     Activity(states)
+  }
+
+  override def adminHandlers: Seq[Admin.Handler] = Seq(
+    Admin.Handler(
+      s"/interpreter_state/io.l5d.namerd/$namespace.json",
+      new NamerClientStateHandler(
+        bindCache, addrCache
+      )
+    )
+  )
+
+  class NamerClientStateHandler(
+    getBindCache: => Map[(Dtab, Path), InstrumentedBind],
+    getAddrCache: => Map[Path, InstrumentedAddr]
+  ) extends Service[Request, Response] {
+
+    private[this] val mapper = Parser.jsonObjectMapper(Nil)
+
+    override def apply(request: Request): Future[Response] = {
+
+      val bindState = getBindCache.groupBy {
+        case ((dtab, path), bind) => path
+      }.map {
+        case (path, binds) =>
+          path.show -> binds.map {
+            case ((dtab, _), InstrumentedBind(act, poll)) =>
+              val snapshot = act.stateSnapshot().map { treeOpt =>
+                treeOpt.map { tree =>
+                  tree.map { bound =>
+                    Map("id" -> bound.id, "path" -> bound.path)
+                  }
+                }
+              }
+              dtab.show -> Map(
+                "state" -> snapshot,
+                "poll" -> poll
+              )
+          }
+      }
+      val addrState = getAddrCache.map {
+        case (path, InstrumentedAddr(act, poll)) =>
+          path.show -> Map(
+            "state" -> act.stateSnapshot(),
+            "poll" -> poll
+          )
+      }
+
+      val state = Map(
+        "bind" -> bindState,
+        "addr" -> addrState
+      )
+      val json = mapper.writeValueAsString(state)
+
+      val res = Response()
+      res.mediaType = MediaType.Json
+      res.contentString = json
+      Future.value(res)
+    }
   }
 }

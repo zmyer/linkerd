@@ -1,7 +1,7 @@
 package io.buoyant.router
 
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.{ServiceFactory, Stack}
 import com.twitter.finagle.service.{Backoff, Retries, RetryBudget}
 import com.twitter.util.Duration
@@ -20,7 +20,7 @@ object RetryBudgetModule {
       // See ClassifieredRetries.Backoffs for the backoff that is actually used in
       // the path stack.
       val budget = Retries.Budget(mkBudget(params[RetryBudgetConfig]), Backoff.constant(Duration.Zero))
-      Stack.Leaf(role, next.make(params + budget))
+      Stack.leaf(role, next.make(params + budget))
     }
   }
 

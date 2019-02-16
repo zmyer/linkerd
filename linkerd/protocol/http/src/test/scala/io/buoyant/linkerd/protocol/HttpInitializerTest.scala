@@ -1,15 +1,12 @@
 package io.buoyant.linkerd.protocol
 
-import com.twitter.conversions.storage._
-import com.twitter.conversions.time._
+import com.twitter.conversions.StorageUnitOps._
 import com.twitter.finagle.{Service, ServiceFactory, Stack, param}
 import com.twitter.finagle.http.{param => hparam}
 import com.twitter.finagle.http.{Request, Response, Status, Version}
-import com.twitter.finagle.service.Retries
-import com.twitter.finagle.stack.nilStack
 import com.twitter.finagle.stats.InMemoryStatsReceiver
-import com.twitter.io.Reader
-import com.twitter.util.{Future, MockTimer, Promise, Time}
+import com.twitter.io.Pipe
+import com.twitter.util.{Future, Promise, Time}
 import io.buoyant.linkerd.protocol.http.ResponseClassifiers
 import io.buoyant.router.RetryBudgetConfig
 import io.buoyant.router.RetryBudgetModule.{param => ev}
@@ -27,7 +24,7 @@ class HttpInitializerTest extends FunSuite with Awaits with Eventually {
     val http = new HttpInitializer {
       val svc = new Service[Request, Response] {
         def apply(req: Request) = {
-          val rw = Reader.writable()
+          val rw = new Pipe()
           val rsp = Response(req.version, Status.Ok, rw)
           val _ = bodyP.before(rw.close())
           respondingP.setDone()
@@ -42,7 +39,7 @@ class HttpInitializerTest extends FunSuite with Awaits with Eventually {
       val sf = ServiceFactory { () => serviceP.before(Future.value(svc)) }
 
       def make(params: Stack.Params = Stack.Params.empty) =
-        (defaultRouter.pathStack ++ Stack.Leaf(Stack.Role("leaf"), sf)).make(params)
+        (defaultRouter.pathStack ++ Stack.leaf(Stack.Role("leaf"), sf)).make(params)
     }
 
     // The factory is returned immediately because it is wrapped in a
@@ -78,7 +75,7 @@ class HttpInitializerTest extends FunSuite with Awaits with Eventually {
     bodyP.setDone()
     assert(!closedP.isDefined)
 
-    assert(await(rsp.reader.read(1)) == None)
+    assert(await(rsp.reader.read()) == None)
     eventually { assert(closedP.isDefined) }
   }
 
@@ -91,7 +88,7 @@ class HttpInitializerTest extends FunSuite with Awaits with Eventually {
       })
 
       def make(params: Stack.Params = Stack.Params.empty) =
-        (defaultRouter.pathStack ++ Stack.Leaf(Stack.Role("leaf"), sf)).make(params)
+        (defaultRouter.pathStack ++ Stack.leaf(Stack.Role("leaf"), sf)).make(params)
     }
 
     val params = Stack.Params.empty +
@@ -121,7 +118,7 @@ class HttpInitializerTest extends FunSuite with Awaits with Eventually {
       })
 
       def make(params: Stack.Params = Stack.Params.empty) =
-        (defaultRouter.pathStack ++ Stack.Leaf(Stack.Role("leaf"), sf)).make(params)
+        (defaultRouter.pathStack ++ Stack.leaf(Stack.Role("leaf"), sf)).make(params)
     }
 
     val stats = new InMemoryStatsReceiver
@@ -138,7 +135,6 @@ class HttpInitializerTest extends FunSuite with Awaits with Eventually {
   }
 
   test("server has codec parameters from router") {
-    val maxChunkSize = hparam.MaxChunkSize(10.kilobytes)
     val maxHeaderSize = hparam.MaxHeaderSize(20.kilobytes)
     val maxInitLineSize = hparam.MaxInitialLineSize(30.kilobytes)
     val maxReqSize = hparam.MaxRequestSize(40.kilobytes)
@@ -147,14 +143,13 @@ class HttpInitializerTest extends FunSuite with Awaits with Eventually {
     val compression = hparam.CompressionLevel(3)
 
     val router = HttpInitializer.router
-      .configured(maxChunkSize).configured(maxHeaderSize).configured(maxInitLineSize)
+      .configured(maxHeaderSize).configured(maxInitLineSize)
       .configured(maxReqSize).configured(maxRspSize)
       .configured(streaming).configured(compression)
       .serving(HttpServerConfig(None, None).mk(HttpInitializer, "yolo"))
       .initialize()
     assert(router.servers.size == 1)
     val sparams = router.servers.head.params
-    assert(sparams[hparam.MaxChunkSize] == maxChunkSize)
     assert(sparams[hparam.MaxHeaderSize] == maxHeaderSize)
     assert(sparams[hparam.MaxInitialLineSize] == maxInitLineSize)
     assert(sparams[hparam.MaxRequestSize] == maxReqSize)

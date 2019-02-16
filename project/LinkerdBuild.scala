@@ -14,12 +14,14 @@ object LinkerdBuild extends Base {
   val Dcos = config("dcos") extend Bundle
   val Jdk = config("jdk") extend Bundle
   val LowMem = config("lowmem") extend Bundle
+  val OpenJ9 = config("openj9") extend Bundle
 
   val configCore = projectDir("config")
     .dependsOn(Finagle.buoyantCore)
     .withTwitterLibs(Deps.finagle("core"))
     .withLibs(Deps.jackson)
     .withLib(Deps.jacksonYaml)
+    .withLib(Deps.guava)
     .withTests()
 
   val consul = projectDir("consul")
@@ -45,7 +47,7 @@ object LinkerdBuild extends Base {
     .withTests()
 
   lazy val k8s = projectDir("k8s")
-    .dependsOn(Namer.core, istioProto)
+    .dependsOn(Namer.core, istioProto, admin)
     .withTwitterLib(Deps.finagle("http"))
     .withLibs(Deps.jackson)
     .withTests()
@@ -55,9 +57,79 @@ object LinkerdBuild extends Base {
     .withLibs(Deps.jackson)
     .withTests()
 
+  object Mesh {
+    val core = projectDir("mesh/core")
+      .dependsOn(Grpc.runtime)
+      .withGrpc
+
+    val all = aggregateDir("mesh", core)
+  }
+
+  val admin = projectDir("admin")
+    .dependsOn(configCore)
+    .withTwitterLib(Deps.twitterServer)
+    .withTwitterLib(Deps.finagle("stats"))
+    .withTests()
+
+  object Namer {
+    val core = projectDir("namer/core")
+      .dependsOn(configCore, admin)
+      .withLib(Deps.jacksonCore)
+      .withTests()
+
+    val consul = projectDir("namer/consul")
+      .dependsOn(LinkerdBuild.consul, core, admin)
+      .withTests()
+
+    val curator = projectDir("namer/curator")
+      .dependsOn(core)
+      .withLibs(Deps.curatorFramework, Deps.curatorClient, Deps.curatorDiscovery)
+      .withTests()
+
+    val dnssrv = projectDir("namer/dnssrv")
+      .dependsOn(core)
+      .withLibs(Deps.dnsJava)
+      .withTests().withIntegration()
+
+    val fs = projectDir("namer/fs")
+      .dependsOn(core % "compile->compile;test->test")
+      .withTests()
+
+    val k8s = projectDir("namer/k8s")
+      .dependsOn(LinkerdBuild.k8s, core)
+      .withTests()
+
+    val istio = projectDir("namer/istio")
+      .dependsOn(LinkerdBuild.istio, core)
+      .withTests()
+
+    val marathon = projectDir("namer/marathon")
+      .dependsOn(LinkerdBuild.marathon, core, admin)
+      .withLib(Deps.jwt)
+      .withTests()
+
+    val serversets = projectDir("namer/serversets")
+      .withTwitterLib(Deps.finagle("serversets").exclude("org.slf4j", "slf4j-jdk14"))
+      .withTests()
+      .dependsOn(core % "compile->compile;test->test")
+
+    val zkLeader = projectDir("namer/zk-leader")
+      .dependsOn(core)
+      .withLib(Deps.zkCandidate)
+      .withTests()
+
+    val rancher = projectDir("namer/rancher")
+      .dependsOn(core)
+      .withTwitterLib(Deps.finagle("http"))
+      .withTests()
+
+    val all = aggregateDir("namer", core, consul, curator, dnssrv, fs, k8s, istio, marathon, serversets, zkLeader, rancher)
+
+  }
+
   object Router {
     val core = projectDir("router/core")
-      .dependsOn(Finagle.buoyantCore)
+      .dependsOn(Finagle.buoyantCore, Namer.core)
       .withTwitterLib(Deps.finagle("core"))
       .withTests()
       .withE2e()
@@ -85,7 +157,10 @@ object LinkerdBuild extends Base {
 
     val thriftIdl = projectDir("router/thrift-idl")
       .withTwitterLib(Deps.finagle("thrift"))
-      .settings(coverageExcludedPackages := ".*thriftscala.*")
+      .settings(Seq(
+        coverageExcludedPackages := ".*thriftscala.*",
+        scalacOptions -= "-Xfatal-warnings")
+      )
 
     val thrift = projectDir("router/thrift")
       .withTwitterLib(Deps.finagle("thrift"))
@@ -109,74 +184,8 @@ object LinkerdBuild extends Base {
     val all = aggregateDir("router", core, baseHttp, h2, http, mux, thrift, thriftMux)
   }
 
-  object Mesh {
-    val core = projectDir("mesh/core")
-      .dependsOn(Grpc.runtime)
-      .withGrpc
-
-    val all = aggregateDir("mesh", core)
-  }
-
-  object Namer {
-    val core = projectDir("namer/core")
-      .dependsOn(configCore)
-      .withLib(Deps.jacksonCore)
-      .withTests()
-
-    val consul = projectDir("namer/consul")
-      .dependsOn(LinkerdBuild.consul, core)
-      .withTests()
-
-    val curator = projectDir("namer/curator")
-      .dependsOn(core)
-      .withLibs(Deps.curatorFramework, Deps.curatorClient, Deps.curatorDiscovery)
-      .withTests()
-
-    val dnssrv = projectDir("namer/dnssrv")
-      .dependsOn(core)
-      .withLibs(Deps.dnsJava)
-      .withTests().withIntegration()
-
-    val fs = projectDir("namer/fs")
-      .dependsOn(core % "compile->compile;test->test")
-      .withTests()
-
-    val k8s = projectDir("namer/k8s")
-      .dependsOn(LinkerdBuild.k8s, core)
-      .withTests()
-
-    val istio = projectDir("namer/istio")
-      .dependsOn(LinkerdBuild.istio, core)
-      .withTests()
-
-    val marathon = projectDir("namer/marathon")
-      .dependsOn(LinkerdBuild.marathon, core)
-      .withLib(Deps.jwt)
-      .withTests()
-
-    val serversets = projectDir("namer/serversets")
-      .withTwitterLib(Deps.finagle("serversets").exclude("org.slf4j", "slf4j-jdk14"))
-      .withTests()
-      .dependsOn(core % "compile->compile;test->test")
-
-    val zkLeader = projectDir("namer/zk-leader")
-      .dependsOn(core)
-      .withLib(Deps.zkCandidate)
-      .withTests()
-
-    val rancher = projectDir("namer/rancher")
-      .dependsOn(core)
-      .withTwitterLib(Deps.finagle("http"))
-      .withTests()
-
-    val all = aggregateDir("namer", core, consul, curator, dnssrv, fs, k8s, istio, marathon, serversets, zkLeader, rancher)
-
-  }
-
-  val admin = projectDir("admin")
-    .dependsOn(configCore, Namer.core)
-    .withTwitterLib(Deps.twitterServer)
-    .withTwitterLib(Deps.finagle("stats"))
+  val adminNames = projectDir("admin/names")
+    .dependsOn(admin, Namer.core)
     .withTests()
 
   object Telemetry {
@@ -214,7 +223,8 @@ object LinkerdBuild extends Base {
       .dependsOn(admin, core, Router.core)
 
     val zipkin = projectDir("telemetry/zipkin")
-      .withTwitterLibs(Deps.finagle("zipkin-core"), Deps.finagle("zipkin"))
+      .withTwitterLibs(Deps.finagle("zipkin-core"), Deps.finagle("zipkin-scribe"))
+        .settings(Seq(scalacOptions -= "-Xfatal-warnings"))
       .dependsOn(core, Router.core)
       .withTests()
 
@@ -224,23 +234,31 @@ object LinkerdBuild extends Base {
   val ConfigFileRE = """^(.*)\.yaml$""".r
 
   val execScriptJvmOptions =
-    """|DEFAULT_JVM_OPTIONS="-Djava.net.preferIPv4Stack=true \
-       |   -Dsun.net.inetaddr.ttl=60                         \
-       |   -Xms${JVM_HEAP_MIN:-32M}                          \
-       |   -Xmx${JVM_HEAP_MAX:-1024M}                        \
-       |   -XX:+AggressiveOpts                               \
-       |   -XX:+UseConcMarkSweepGC                           \
-       |   -XX:+CMSParallelRemarkEnabled                     \
-       |   -XX:+CMSClassUnloadingEnabled                     \
-       |   -XX:+ScavengeBeforeFullGC                         \
-       |   -XX:+CMSScavengeBeforeRemark                      \
-       |   -XX:+UseCMSInitiatingOccupancyOnly                \
-       |   -XX:CMSInitiatingOccupancyFraction=70             \
-       |   -XX:-TieredCompilation                            \
-       |   -XX:+UseStringDeduplication                       \
-       |   -Dcom.twitter.util.events.sinkEnabled=false       \
-       |   -Dorg.apache.thrift.readLength=10485760           \
-       |   ${LOCAL_JVM_OPTIONS:-}                            "
+    """|DEFAULT_JVM_OPTIONS="$DEFAULT_JVM_OPTIONS                        \
+       |   -Djava.net.preferIPv4Stack=true                               \
+       |   -Dsun.net.inetaddr.ttl=60                                     \
+       |   -Xms${JVM_HEAP_MIN:-32M}                                      \
+       |   -Xmx${JVM_HEAP_MAX:-1024M}                                    \
+       |   -XX:+AggressiveOpts                                           \
+       |   -XX:+CMSParallelRemarkEnabled                                 \
+       |   -XX:+CMSClassUnloadingEnabled                                 \
+       |   -XX:+ScavengeBeforeFullGC                                     \
+       |   -XX:+CMSScavengeBeforeRemark                                  \
+       |   -XX:+UseCMSInitiatingOccupancyOnly                            \
+       |   -XX:CMSInitiatingOccupancyFraction=70                         \
+       |   -XX:-TieredCompilation                                        \
+       |   -XX:+UseStringDeduplication                                   \
+       |   -XX:+AlwaysPreTouch                                           \
+       |   -Dcom.twitter.util.events.sinkEnabled=false                   \
+       |   -Dorg.apache.thrift.readLength=10485760                       \
+       |   -Djdk.nio.maxCachedBufferSize=262144                          \
+       |   -Dio.netty.threadLocalDirectBufferSize=0                      \
+       |   -Dio.netty.recycler.maxCapacity=4096                          \
+       |   -Dio.netty.allocator.numHeapArenas=${FINAGLE_WORKERS:-8}      \
+       |   -Dio.netty.allocator.numDirectArenas=${FINAGLE_WORKERS:-8}    \
+       |   -Dcom.twitter.finagle.netty4.numWorkers=${FINAGLE_WORKERS:-8} \
+       |   ${GC_LOG_OPTION:-}                                            \
+       |   ${LOCAL_JVM_OPTIONS:-}                                        "
        |""".stripMargin
 
   object Namerd {
@@ -248,6 +266,7 @@ object LinkerdBuild extends Base {
     val core = projectDir("namerd/core")
       .dependsOn(
         admin,
+        adminNames,
         configCore,
         Namer.core,
         Namer.fs % "test",
@@ -296,7 +315,10 @@ object LinkerdBuild extends Base {
 
       val interpreterThriftIdl = projectDir("namerd/iface/interpreter-thrift-idl")
         .withTwitterLib(Deps.finagle("thrift"))
-        .settings(coverageExcludedPackages := ".*thriftscala.*")
+        .settings(Seq(
+          coverageExcludedPackages := ".*thriftscala.*",
+          scalacOptions -= "-Xfatal-warnings")
+        )
 
       val interpreterThrift = projectDir("namerd/iface/interpreter-thrift")
         .dependsOn(core, interpreterThriftIdl)
@@ -308,9 +330,14 @@ object LinkerdBuild extends Base {
         .dependsOn(core, Mesh.core)
         .withTests()
 
+      val destination = projectDir("namerd/iface/destination")
+        .dependsOn(core, Grpc.runtime)
+        .withGrpc
+        .withTests()
+
       val all = aggregateDir(
         "namerd/iface",
-        controlHttp, interpreterThriftIdl, interpreterThrift, mesh
+        controlHttp, interpreterThriftIdl, interpreterThrift, mesh, destination
       )
     }
 
@@ -327,15 +354,50 @@ object LinkerdBuild extends Base {
       """|#!/bin/sh
          |
          |jars="$0"
+         |HSPREF_SETTING=$([ ! -z "$ENABLE_HSPREF" ] && echo "" || echo "-XX:+PerfDisableSharedMem")
          |if [ -n "$NAMERD_HOME" ] && [ -d $NAMERD_HOME/plugins ]; then
          |  for jar in $NAMERD_HOME/plugins/*.jar ; do
          |    jars="$jars:$jar"
          |  done
          |fi
+         |
+         |export MALLOC_ARENA_MAX=2
+         |
+         |# Configure GC logging directory
+         |if [ -z "$GC_LOG" ]; then
+         |  GC_LOG="/var/log/namerd"
+         |fi
+         |
+         |mkdir -p "$GC_LOG" && [ -w "$GC_LOG" ]
+         |
+         |if [ $? -ne 0 ]; then
+         |  echo "GC_LOG must be set to a directory that user [$USER] has write permissions on.\
+         | Unable to use [$GC_LOG] for GC logging."
+         |else
+         |  version=$("${JAVA_HOME:-/usr}"/bin/java -version 2>&1 | sed 's/.*version "\([0-9]*\)\..*/\1/; 1q')
+         |
+         |  if [ "$version" -ge 9 ]; then
+         |    GC_LOG_OPTION="-Xlog:gc*,gc+age=trace,gc+heap=debug,gc+promotion=trace,safepoint:file=${GC_LOG}/gc.log::filecount=10,filesize=10000:time"
+         |  else
+         |    GC_LOG_OPTION="
+         |      -XX:+PrintGCDetails
+         |      -XX:+PrintGCDateStamps
+         |      -XX:+PrintHeapAtGC
+         |      -XX:+PrintTenuringDistribution
+         |      -XX:+PrintGCApplicationStoppedTime
+         |      -XX:+PrintPromotionFailure
+         |      -Xloggc:${GC_LOG}/gc.log
+         |      -XX:+UseGCLogFileRotation
+         |      -XX:NumberOfGCLogFiles=10
+         |      -XX:GCLogFileSize=10M"
+         |    DEFAULT_JVM_OPTIONS="-XX:+UseConcMarkSweepGC"
+         |  fi
+         |fi
+         |
          |""" +
       execScriptJvmOptions +
       """|exec "${JAVA_HOME:-/usr}/bin/java" -XX:+PrintCommandLineFlags \
-         |     ${JVM_OPTIONS:-$DEFAULT_JVM_OPTIONS} -cp $jars -server \
+         |     ${JVM_OPTIONS:-$DEFAULT_JVM_OPTIONS} $HSPREF_SETTING -cp $jars -server \
          |     io.buoyant.namerd.Main "$@"
          |"""
       ).stripMargin
@@ -351,7 +413,7 @@ object LinkerdBuild extends Base {
 
     val BundleProjects = Seq[ProjectReference](
       core, main, Namer.fs, Storage.inMemory, Router.http,
-      Iface.controlHttp, Iface.interpreterThrift, Iface.mesh,
+      Iface.controlHttp, Iface.interpreterThrift, Iface.mesh, Iface.destination,
       Namer.consul, Namer.k8s, Namer.marathon, Namer.serversets, Namer.zkLeader, Namer.dnssrv, Namer.rancher,
       Iface.mesh,
       Interpreter.perHost, Interpreter.k8s,
@@ -371,6 +433,12 @@ object LinkerdBuild extends Base {
       assemblyJarName in assembly := s"${name.value}-${version.value}-32b-exec"
     )
 
+    val OpenJ9Settings = BundleSettings ++ Seq(
+      dockerJavaImage := s"adoptopenjdk/openjdk8-openj9:${openJ9Version}",
+      dockerTag := s"${version.value}-openj9-experimental",
+      assemblyJarName in assembly := s"${name.value}-${version.value}-openj9-experimental"
+    )
+
     /**
      * A DCOS-specific assembly-running script that:
      * 1) adds the namerd plugin directory to the classpath if it exists
@@ -381,11 +449,46 @@ object LinkerdBuild extends Base {
       """|#!/bin/bash
          |
          |jars="$0"
+         |HSPREF_SETTING=$([ ! -z "$ENABLE_HSPREF" ] && echo "" || echo "-XX:+PerfDisableSharedMem")
          |if [ -n "$NAMERD_HOME" ] && [ -d $NAMERD_HOME/plugins ]; then
          |  for jar in $NAMERD_HOME/plugins/*.jar ; do
          |    jars="$jars:$jar"
          |  done
          |fi
+         |
+         |export MALLOC_ARENA_MAX=2
+         |
+         |# Configure GC logging directory
+         |if [ -z "$GC_LOG" ]; then
+         |  GC_LOG="/var/log/namerd"
+         |fi
+         |
+         |mkdir -p "$GC_LOG" && [ -w "$GC_LOG" ]
+         |
+         |if [ $? -ne 0 ]; then
+         |  echo "GC_LOG must be set to a directory that user [$USER] has write permissions on.\
+         | Unable to use [$GC_LOG] for GC logging."
+         |else
+         |  version=$("${JAVA_HOME:-/usr}"/bin/java -version 2>&1 | sed 's/.*version "\([0-9]*\)\..*/\1/; 1q')
+         |
+         |  if [ "$version" -ge 9 ]; then
+         |    GC_LOG_OPTION="-Xlog:gc*,gc+age=trace,gc+heap=debug,gc+promotion=trace,safepoint:file=${GC_LOG}/gc.log::filecount=10,filesize=10000:time"
+         |  else
+         |    GC_LOG_OPTION="
+         |      -XX:+PrintGCDetails
+         |      -XX:+PrintGCDateStamps
+         |      -XX:+PrintHeapAtGC
+         |      -XX:+PrintTenuringDistribution
+         |      -XX:+PrintGCApplicationStoppedTime
+         |      -XX:+PrintPromotionFailure
+         |      -Xloggc:${GC_LOG}/gc.log
+         |      -XX:+UseGCLogFileRotation
+         |      -XX:NumberOfGCLogFiles=10
+         |      -XX:GCLogFileSize=10M"
+         |    DEFAULT_JVM_OPTIONS="-XX:+UseConcMarkSweepGC"
+         |  fi
+         |fi
+         |
          |""" +
       execScriptJvmOptions +
       """|if read -t 0; then
@@ -394,7 +497,7 @@ object LinkerdBuild extends Base {
          |
          |echo $CONFIG_INPUT | \
          |${JAVA_HOME:-/usr}/bin/java -XX:+PrintCommandLineFlags \
-         |${JVM_OPTIONS:-$DEFAULT_JVM_OPTIONS} -cp $jars -server \
+         |${JVM_OPTIONS:-$DEFAULT_JVM_OPTIONS} $HSPREF_SETTING -cp $jars -server \
          |io.buoyant.namerd.DcosBootstrap "$@"
          |
          |echo $CONFIG_INPUT | \
@@ -417,7 +520,7 @@ object LinkerdBuild extends Base {
 
     val all = aggregateDir("namerd",
         core, dcosBootstrap, main, Storage.all, Interpreter.all, Iface.all)
-      .configs(Bundle, Dcos, Jdk, LowMem)
+      .configs(Bundle, Dcos, Jdk, LowMem, OpenJ9)
       // Bundle includes all of the supported features:
       .configDependsOn(Bundle)(BundleProjects: _*)
       .settings(inConfig(Bundle)(BundleSettings))
@@ -425,6 +528,8 @@ object LinkerdBuild extends Base {
       .settings(inConfig(Jdk)(JdkSettings))
       .configDependsOn(LowMem)(BundleProjects: _*)
       .settings(inConfig(LowMem)(LowMemSettings))
+      .configDependsOn(OpenJ9)(BundleProjects: _*)
+      .settings(inConfig(OpenJ9)(OpenJ9Settings))
       .configDependsOn(Dcos)(dcosBootstrap)
       .settings(inConfig(Dcos)(DcosSettings))
       .settings(
@@ -462,7 +567,7 @@ object LinkerdBuild extends Base {
 
     val mesh = projectDir("interpreter/mesh")
       .withTests()
-      .dependsOn(Namer.core, Mesh.core, Grpc.runtime)
+      .dependsOn(Namer.core, Mesh.core, Grpc.runtime, admin)
 
     val subnet = projectDir("interpreter/subnet")
       .dependsOn(Namer.core)
@@ -480,7 +585,11 @@ object LinkerdBuild extends Base {
       .dependsOn(Namer.core, LinkerdBuild.istio, perHost, subnet)
       .withTests()
 
-    val all = aggregateDir("interpreter", fs, k8s, mesh, namerd, perHost, subnet)
+    val consul = projectDir("interpreter/consul")
+      .dependsOn(Namer.core, Namer.consul, Namerd.Storage.consul)
+      .withTests()
+
+    val all = aggregateDir("interpreter", consul, fs, k8s, mesh, namerd, perHost, subnet)
   }
 
   object Linkerd {
@@ -559,15 +668,16 @@ object LinkerdBuild extends Base {
       .withTwitterLib(Deps.twitterServer)
       .withTests()
       .dependsOn(core % "compile->compile;test->test")
-      .dependsOn(LinkerdBuild.admin, Namer.core, Router.http)
+      .dependsOn(LinkerdBuild.admin, LinkerdBuild.adminNames, Namer.core, Router.http)
       .dependsOn(Protocol.thrift % "test", Interpreter.perHost % "test")
 
     val main = projectDir("linkerd/main")
-      .dependsOn(admin, configCore, core)
+      .dependsOn(admin, configCore, core, Protocol.http % "e2e", Interpreter.namerd % "e2e", Interpreter.perHost % "e2e")
       .withTwitterLib(Deps.twitterServer)
       .withLibs(Deps.jacksonCore, Deps.jacksonDatabind, Deps.jacksonYaml)
       .withBuildProperties("io/buoyant/linkerd")
       .settings(coverageExcludedPackages := ".*")
+      .withE2e()
 
     /*
      * linkerd packaging configurations.
@@ -584,15 +694,50 @@ object LinkerdBuild extends Base {
       """|#!/bin/sh
          |
          |jars="$0"
+         |HSPREF_SETTING=$([ ! -z "$ENABLE_HSPREF" ] && echo "" || echo "-XX:+PerfDisableSharedMem")
          |if [ -n "$L5D_HOME" ] && [ -d $L5D_HOME/plugins ]; then
          |  for jar in $L5D_HOME/plugins/*.jar ; do
          |    jars="$jars:$jar"
          |  done
          |fi
+         |
+         |export MALLOC_ARENA_MAX=2
+         |
+         |# Configure GC logging directory
+         |if [ -z "$GC_LOG" ]; then
+         |  GC_LOG="/var/log/linkerd"
+         |fi
+         |
+         |mkdir -p "$GC_LOG" && [ -w "$GC_LOG" ]
+         |
+         |if [ $? -ne 0 ]; then
+         |  echo "GC_LOG must be set to a directory that user [$USER] has write permissions on.\
+         | Unable to use [$GC_LOG] for GC logging."
+         |else
+         |  version=$("${JAVA_HOME:-/usr}"/bin/java -version 2>&1 | sed 's/.*version "\([0-9]*\)\..*/\1/; 1q')
+         |
+         |  if [ "$version" -ge 9 ]; then
+         |    GC_LOG_OPTION="-Xlog:gc*,gc+age=trace,gc+heap=debug,gc+promotion=trace,safepoint:file=${GC_LOG}/gc.log::filecount=10,filesize=10000:time"
+         |  else
+         |    GC_LOG_OPTION="
+         |      -XX:+PrintGCDetails
+         |      -XX:+PrintGCDateStamps
+         |      -XX:+PrintHeapAtGC
+         |      -XX:+PrintTenuringDistribution
+         |      -XX:+PrintGCApplicationStoppedTime
+         |      -XX:+PrintPromotionFailure
+         |      -Xloggc:${GC_LOG}/gc.log
+         |      -XX:+UseGCLogFileRotation
+         |      -XX:NumberOfGCLogFiles=10
+         |      -XX:GCLogFileSize=10M"
+         |    DEFAULT_JVM_OPTIONS="-XX:+UseConcMarkSweepGC"
+         |  fi
+         |fi
+         |
          |""" +
       execScriptJvmOptions +
       """|exec "${JAVA_HOME:-/usr}/bin/java" -XX:+PrintCommandLineFlags \
-         |     ${JVM_OPTIONS:-$DEFAULT_JVM_OPTIONS} -cp $jars -server \
+         |     ${JVM_OPTIONS:-$DEFAULT_JVM_OPTIONS} $HSPREF_SETTING -cp $jars -server \
          |     io.buoyant.linkerd.Main "$@"
          |"""
       ).stripMargin
@@ -609,7 +754,7 @@ object LinkerdBuild extends Base {
     val BundleProjects = Seq[ProjectReference](
       admin, core, main, configCore,
       Namer.consul, Namer.fs, Namer.k8s, Namer.istio, Namer.marathon, Namer.serversets, Namer.zkLeader, Namer.curator, Namer.dnssrv, Namer.rancher,
-      Interpreter.fs, Interpreter.k8s, Interpreter.istio, Interpreter.mesh, Interpreter.namerd, Interpreter.perHost, Interpreter.subnet,
+      Interpreter.fs, Interpreter.k8s, Interpreter.istio, Interpreter.mesh, Interpreter.namerd, Interpreter.perHost, Interpreter.subnet, Interpreter.consul,
       Protocol.h2, Protocol.http, Protocol.mux, Protocol.thrift, Protocol.thriftMux,
       Announcer.serversets,
       Telemetry.adminMetricsExport, Telemetry.core, Telemetry.influxdb, Telemetry.prometheus, Telemetry.recentRequests, Telemetry.statsd, Telemetry.tracelog, Telemetry.zipkin,
@@ -629,10 +774,16 @@ object LinkerdBuild extends Base {
       assemblyJarName in assembly := s"${name.value}-${version.value}-jdk-exec"
     )
 
+    val OpenJ9Settings = BundleSettings ++ Seq(
+      dockerJavaImage := s"adoptopenjdk/openjdk8-openj9:${openJ9Version}",
+      dockerTag := s"${version.value}-openj9-experimental",
+      assemblyJarName in assembly := s"${name.value}-${version.value}-openj9-experimental"
+    )
+
     val all = aggregateDir("linkerd",
         admin, configCore, core, failureAccrual, main, tls,
         Announcer.all, Namer.all, Protocol.all)
-      .configs(Bundle, Jdk, LowMem)
+      .configs(Bundle, Jdk, LowMem, OpenJ9)
       // Bundle is includes all of the supported features:
       .configDependsOn(Bundle)(BundleProjects: _*)
       .settings(inConfig(Bundle)(BundleSettings))
@@ -640,6 +791,8 @@ object LinkerdBuild extends Base {
       .settings(inConfig(Jdk)(JdkSettings))
       .configDependsOn(LowMem)(BundleProjects: _*)
       .settings(inConfig(LowMem)(LowMemSettings))
+      .configDependsOn(OpenJ9)(BundleProjects: _*)
+      .settings(inConfig(OpenJ9)(OpenJ9Settings))
       .settings(
         assembly := (assembly in Bundle).value,
         docker := (docker in Bundle).value,
@@ -726,6 +879,7 @@ object LinkerdBuild extends Base {
   val namerdIfaceInterpreterThriftIdl = Namerd.Iface.interpreterThriftIdl
   val namerdIfaceInterpreterThrift = Namerd.Iface.interpreterThrift
   val namerdIfaceMesh = Namerd.Iface.mesh
+  val namerdIfaceDestination = Namerd.Iface.destination
   val namerdStorageEtcd = Namerd.Storage.etcd
   val namerdStorageInMemory = Namerd.Storage.inMemory
   val namerdStorageK8s = Namerd.Storage.k8s
@@ -735,6 +889,7 @@ object LinkerdBuild extends Base {
   val namerdMain = Namerd.main
 
   val interpreter = Interpreter.all
+  val interpreterConsul = Interpreter.consul
   val interpreterFs = Interpreter.fs
   val interpreterK8s = Interpreter.k8s
   val interpreterIstio = Interpreter.istio
@@ -766,6 +921,7 @@ object LinkerdBuild extends Base {
     .settings(aggregateSettings ++ unidocSettings)
     .aggregate(
       admin,
+      adminNames,
       configCore,
       consul,
       etcd,

@@ -1,8 +1,9 @@
 package com.twitter.finagle.buoyant.h2
 
 import com.twitter.concurrent.AsyncQueue
-import com.twitter.io.Buf
 import com.twitter.util.{Future, Promise, Return, Throw, Try}
+import io.netty.buffer.{ByteBuf, Unpooled}
+import java.nio.charset.{StandardCharsets => JChar}
 
 /**
  * A Stream represents a stream of Data frames, optionally
@@ -12,18 +13,34 @@ import com.twitter.util.{Future, Promise, Return, Throw, Try}
  * flow control semantics are built into the Stream--consumers MUST
  * release each data frame after it has processed its contents.
  *
- * Consumers SHOULD call `read()` until it fails (i.e. when the
- * stream is fully closed).
- *
- * If a consumer cancels a `read()` Future, the stream is reset.
+ * Consumers SHOULD call `read()` until they read an EOS frame or
+ * until `read()` fails.  Consumers who wish to stop calling `read()`
+ * before the Stream is complete may call `cancel()` instead.
  */
 trait Stream {
   override def toString = s"Stream(isEmpty=$isEmpty, onEnd=${onEnd.poll})"
 
+  /**
+   * This indicates that this is a Stream that will never contain any frames.  Messages that have
+   * the EOS flag set on their Headers frame will contain a Stream with `isEmpty==true`.  All
+   * Streams will have an EOS frame as their final frame except for Stream with `isEmpty==true`.
+   */
   def isEmpty: Boolean
   final def nonEmpty: Boolean = !isEmpty
 
+  /**
+   * Read a Frame from the Stream.  Interrupting this Future will have no effect --- use the cancel
+   * method to signal cancellation.
+   */
   def read(): Future[Frame]
+
+  /**
+   * Consumers of this Stream may call cancel to indicate that they no longer wish to read from it.
+   * This will cause the `onCancel` Future to become satisfied so that producers will know to stop
+   * writing to this Stream.  Outstanding and subsequent calls to read will fail after cancel is
+   * called.
+   */
+  def cancel(reset: Reset): Unit
 
   /**
    * Satisfied when an end-of-stream frame has been read from this
@@ -34,25 +51,31 @@ trait Stream {
   def onEnd: Future[Unit]
 
   /**
-   * Wraps this [[Stream]] with a [[StreamOnFrame]] that calls the
+   * Satisfied when the consumer of a stream cancels it by calling
+   * `cancel()`.
+   */
+  def onCancel: Future[Reset]
+
+  /**
+   * Wraps this Stream with a StreamOnFrame that calls the
    * provided function on each frame after [[Stream.read read()]]
    *
    * @param onFrame the function to call on each frame.
-   * @return a [[StreamOnFrame]] [[StreamProxy]] wrapping this [[Stream]]
+   * @return a StreamOnFrame StreamProxy wrapping this Stream
    */
   def onFrame(onFrame: Try[Frame] => Unit): Stream = new StreamOnFrame(this, onFrame)
 
   /**
-   * Wraps this [[Stream]]  with a function `f` that is called on each frame in
-   * the stream. The sequence of [[Frame]]s yielded by `f` will be inserted into
+   * Wraps this Stream  with a function `f` that is called on each frame in
+   * the stream. The sequence of Frames yielded by `f` will be inserted into
    * the stream in order at the current position.
    *
    * @note that in order to avoid violating flow control, `f` must either take
    *       ownership over the frame and release it, or return it in the returned
    *       sequence of frames.
-   * @see [[StreamFlatMap]]
-   * @param f the function called on each [[Stream]]
-   * @return a [[StreamFlatMap]] [[StreamProxy]] wrapping this [[Stream]]
+   * @see StreamFlatMap
+   * @param f the function called on each Stream
+   * @return a StreamFlatMap StreamProxy wrapping this Stream
    */
   def flatMap(f: Frame => Seq[Frame]): Stream = new StreamFlatMap(this, f)
 
@@ -69,19 +92,53 @@ object Stream {
   // in the dispatcher and server stream
 
   /**
+   * Fail the queue and release all of its Frames.  This can be called as a safe alternative to
+   * q.fail(e, discard = true).
+   */
+  def failAndDrainFrameQueue(q: AsyncQueue[Frame], e: Throwable): Unit = {
+    q.fail(e, discard = false)
+    def drain(q: AsyncQueue[Frame]): Future[Nothing] = {
+      q.poll().flatMap { f =>
+        f.release()
+        drain(q)
+      }
+    }
+    drain(q)
+    ()
+  }
+
+  /**
+   * Read a Stream to the end, Frame.release release()ing each
+   * Frame before reading the next one.
+   *
+   * The value of each frame is discarded, but assertions can be made about
+   * their contents by attaching an Stream.onFrame onFrame() callback
+   * before calling `readAll()`.
+   *
+   * @param stream the Stream to read to the end
+   * @return a Future that will finish when the whole stream is read
+   */
+
+  def readToEnd(stream: Stream): Future[Unit] =
+    if (stream.isEmpty) Future.Unit
+    else
+      stream.read().flatMap { frame =>
+        val end = frame.isEnd
+        frame.release().before {
+          if (end) Future.Unit else readToEnd(stream)
+        }
+      }
+
+  /**
    * In order to create a stream, we need a mechanism to write to it.
    */
   trait Writer {
-
     /**
      * Write an object to a Stream so that it may be read as a Frame
      * (i.e. onto an underlying transport). The returned future is not
      * satisfied until the frame is written and released.
      */
     def write(frame: Frame): Future[Unit]
-
-    def reset(err: Reset): Unit
-    def close(): Unit
   }
 
   private[h2] trait AsyncQueueReader extends Stream {
@@ -92,22 +149,34 @@ object Stream {
     private[this] val endP = new Promise[Unit]
     override def onEnd: Future[Unit] = endP
 
+    private[this] val cancelP = new Promise[Reset]
+    override def onCancel: Future[Reset] = cancelP
+
     private[this] val endOnReleaseIfEnd: Try[Frame] => Unit = {
-      case Return(f) => if (f.isEnd) endP.become(f.onRelease)
+      case Return(f) =>
+        if (f.isEnd) {
+          f.onRelease.respond { k =>
+            endP.updateIfEmpty(k); ()
+          }
+        }; ()
       case Throw(e) => endP.updateIfEmpty(Throw(e)); ()
     }
 
     override def read(): Future[Frame] = {
       val f = frameQ.poll()
       f.respond(endOnReleaseIfEnd)
-      failOnInterrupt(f, frameQ)
+    }
+    override def cancel(err: Reset): Unit = {
+      failAndDrainFrameQueue(frameQ, err)
+      endP.updateIfEmpty(Throw(err))
+      val _ = cancelP.updateIfEmpty(Return(err))
     }
   }
 
-  private[this] def failOnInterrupt[T, Q](f: Future[T], q: AsyncQueue[Q]): Future[T] = {
+  private[this] def failOnInterrupt[T](f: Future[T], q: AsyncQueue[Frame]): Future[T] = {
     val p = new Promise[T] with Promise.InterruptHandler {
       override protected def onInterrupt(e: Throwable): Unit = {
-        q.fail(e, discard = true)
+        failAndDrainFrameQueue(q, e)
         f.raise(e)
       }
     }
@@ -119,15 +188,16 @@ object Stream {
     override protected[this] val frameQ = new AsyncQueue[Frame]
 
     override def write(f: Frame): Future[Unit] =
+      /* If this write is interrupted before the Frame is released, we fail the queue.  This is
+       * probably not common because we expect Frames to be released fairly quickly. */
       if (frameQ.offer(f)) failOnInterrupt(f.onRelease, frameQ)
       else Future.exception(Reset.Closed)
-
-    override def reset(err: Reset): Unit = frameQ.fail(err, discard = true)
-    override def close(): Unit = frameQ.fail(Reset.NoError, discard = false)
   }
 
   def apply(q: AsyncQueue[Frame]): Stream =
-    new AsyncQueueReader { override protected[this] val frameQ = q }
+    new AsyncQueueReader {
+      override protected[this] val frameQ = q
+    }
 
   def apply(): Stream with Writer =
     new AsyncQueueReaderWriter
@@ -138,27 +208,22 @@ object Stream {
     apply(q)
   }
 
-  def const(buf: Buf): Stream =
+  def const(buf: ByteBuf): Stream =
     const(Frame.Data.eos(buf))
 
-  def const(s: String): Stream =
-    const(Buf.Utf8(s))
+  def const(s: String): Stream = {
+    val bytes = s.getBytes(JChar.UTF_8)
+    const(Unpooled.wrappedBuffer(bytes))
+  }
 
-  def empty(): Stream with Writer = empty(new AsyncQueue[Frame](1))
-
-  def empty(frameQ: AsyncQueue[Frame]): Stream with Writer =
-    new Stream with Writer {
-      override def isEmpty = true
-      override def onEnd = Future.Unit
-      override def read(): Future[Frame] = failOnInterrupt(frameQ.poll(), frameQ)
-      override def write(f: Frame): Future[Unit] = {
-        frameQ.fail(Reset.Closed, discard = true)
-        Future.exception(Reset.Closed)
-      }
-      override def reset(err: Reset): Unit = frameQ.fail(err, discard = true)
-      override def close(): Unit = frameQ.fail(Reset.NoError, discard = false)
-    }
-
+  def empty(): Stream = new Stream {
+    override def isEmpty = true
+    override def onEnd = Future.Unit
+    override def read(): Future[Frame] = Future.exception(new NotImplementedError("Cannot read from an empty Stream"))
+    override def cancel(err: Reset): Unit = { cancelP.updateIfEmpty(Return(err)); () }
+    private[this] val cancelP = new Promise[Reset]
+    override def onCancel: Future[Reset] = cancelP
+  }
 }
 
 /**
@@ -178,18 +243,18 @@ sealed trait Frame {
 
 object Frame {
   /**
-   * A frame containing aribtrary data.
+   * A frame containing arbitrary data.
    *
    * `release()` MUST be called so that the producer may manage flow control.
    */
   trait Data extends Frame {
-    override def toString = s"Frame.Data(length=${buf.length}, isEnd=$isEnd)"
-    def buf: Buf
+    override def toString = s"Frame.Data(length=${buf.readableBytes()}, isEnd=$isEnd)"
+    def buf: ByteBuf
   }
 
   object Data {
 
-    def apply(buf0: Buf, eos: Boolean, release0: () => Future[Unit]): Data = new Data {
+    def apply(buf0: ByteBuf, eos: Boolean, release0: () => Future[Unit]): Data = new Data {
       def buf = buf0
       private[this] val releaseP = new Promise[Unit]
       def onRelease = releaseP
@@ -201,17 +266,32 @@ object Frame {
       def isEnd = eos
     }
 
-    def apply(buf: Buf, eos: Boolean): Data =
-      apply(buf, eos, () => Future.Unit)
+    object NoopRelease extends Function0[Future[Unit]] {
+      override def apply(): Future[Unit] = Future.Unit
+    }
 
-    def apply(s: String, eos: Boolean, release: () => Future[Unit]): Data =
-      apply(Buf.Utf8(s), eos, release)
+    def apply(buf: ByteBuf, eos: Boolean): Data =
+      apply(buf, eos, NoopRelease)
 
-    def apply(s: String, eos: Boolean): Data =
-      apply(Buf.Utf8(s), eos)
+    def apply(s: String, eos: Boolean, release: () => Future[Unit]): Data = {
+      val bytes = s.getBytes(JChar.UTF_8)
+      apply(Unpooled.wrappedBuffer(bytes), eos, release)
+    }
 
-    def eos(buf: Buf): Data = apply(buf, true)
+    def apply(s: String, eos: Boolean): Data = {
+      val bytes = s.getBytes(JChar.UTF_8)
+      apply(Unpooled.wrappedBuffer(bytes), eos)
+    }
+
+    def eos(buf: ByteBuf): Data = apply(buf, true)
     def eos(s: String): Data = apply(s, true)
+
+    def copy(frame: Data, eos: Boolean): Data = new Data {
+      def buf = frame.buf
+      def onRelease = frame.onRelease
+      def release() = frame.release()
+      def isEnd = eos
+    }
   }
 
   /** A terminal Frame including headers. */

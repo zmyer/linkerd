@@ -2,7 +2,7 @@ package io.buoyant.namer.marathon
 
 import com.twitter.finagle.util.LoadService
 import com.twitter.finagle.{Path, Stack}
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import io.buoyant.config.Parser
 import io.buoyant.config.types.Port
 import io.buoyant.namer.{NamerConfig, NamerInitializer}
@@ -92,8 +92,7 @@ class MarathonTest extends FunSuite {
                   |tls:
                   |  disableValidation: false
                   |  commonName: master.mesos
-                  |  trustCerts:
-                  |    - /foo/caCert.pem
+                  |  trustCertsBundle: /foo/caCert.pem
       """.stripMargin
 
     val mapper = Parser.objectMapper(yaml, Iterable(Seq(MarathonInitializer)))
@@ -108,7 +107,7 @@ class MarathonTest extends FunSuite {
     val tls = marathon.tls.get
     assert(tls.disableValidation.contains(false))
     assert(tls.commonName.contains("master.mesos"))
-    assert(tls.trustCerts.contains(List("/foo/caCert.pem")))
+    assert(tls.trustCertsBundle.contains("/foo/caCert.pem"))
 
     assert(!marathon.disabled)
   }
@@ -171,6 +170,5 @@ class MarathonTest extends FunSuite {
     // assert that we're generating a reasonable amount of distinct TTLs –
     // see above for what constitutes "reasonable"
     assert(jitters.take(300).toSet.size >= MinUniqueTTLs)
-
   }
 }

@@ -86,6 +86,7 @@ Key | Default Value | Description
 --- | ------------- | -----------
 port | protocol dependent | The TCP port number. Protocols may provide default values. If no default is provided, the port parameter is required.
 ip | loopback address | The local IP address. A value like 0.0.0.0 configures the server to listen on all local IPv4 interfaces.
+socketOptions | none | Socket options to set for the router interface. See [Socket Options](#socket-options)
 tls | no tls | The server will serve over TLS if this parameter is provided. see [TLS](#server-tls).
 maxConcurrentRequests | unlimited | The maximum number of concurrent requests the server will accept.
 announce | an empty list | A list of concrete names to announce using the router's [announcers](#announcers).
@@ -221,6 +222,11 @@ If a client matches more than one config's prefix, all parameters from the
 matching configs will be applied, with parameters defined later in the
 configuration file taking precedence over those defined earlier.
 
+Note: Capture variables use greedy pattern matching.  For example (`{foo}{bar}`) is
+ambiguous.  The capture variable (`{foo}`) would capture the whole segement and
+(`{bar}`) would empty.  Similary, the pattern (`{foo}-{bar}`) on the segement
+`a-b-c` would capture `a-b` into (`{foo}`) and `c` in (`{bar}`).
+
 ### Client Parameters
 
 <aside class="notice">
@@ -253,8 +259,13 @@ failFast | `false` | If `true`, connection failures are punished more aggressive
 requeueBudget | see [retry budget](#retry-budget-parameters) | A [requeue budget](#retry-budget-parameters) for connection-level retries.
 failureAccrual | 5 consecutive failures | a [failure accrual policy](#failure-accrual) for all clients created by this router.
 requestAttemptTimeoutMs | no timeout | The timeout, in milliseconds, for each attempt (original or retry) of the request made by this client.
+clientSession | An empty object | see [clientSession](#client-session)
+requestAuthorizers | none | A list of request authorizers.  See [Http/1.1-specific request authorizers](#http-1-1-request-authorizers) or [HTTP/2-specific request authorizers](#http-2-request-authorizers).
 
 #### Host Connection Pool
+
+This section defines the behavior of [watermark connection pools](https://twitter.github.io/finagle/docs/com/twitter/finagle/client/DefaultPool) on which most of the protocols are relying.
+Note that Http2 protocol uses [SingletonPool](https://github.com/twitter/finagle/blob/master/finagle-core/src/main/scala/com/twitter/finagle/pool/SingletonPool.scala) that maintains a single connection per endpoint and will not be affected by the settings in this section. 
 
 ```yaml
 client:
@@ -269,5 +280,14 @@ Key | Default Value | Description
 --- | ------------- | -----------
 minSize | `0` | The minimum number of connections to maintain to each host.
 maxSize | Int.MaxValue | The maximum number of connections to maintain to each host.
-idleTimeMs | forever | The amount of idle time for which a connection is cached in milliseconds.
+idleTimeMs | forever | The amount of idle time for which a connection is cached in milliseconds. Only applied to connections that number greater than minSize, but fewer than maxSize.
 maxWaiters | Int.MaxValue | The maximum number of connection requests that are queued when the connection concurrency exceeds maxSize.
+
+#### Client Session
+
+Configures the behavior of established client sessions.
+
+Key | Default Value | Description
+--- | ------------- | -----------
+idleTimeMs | forever | The max amount of time for which a connection is allowed to be idle. When this time exceeded the connection will close itself.
+lifeTimeMs | forever | Max lifetime of a connection.

@@ -53,7 +53,7 @@ the `config/` directory.
 
 #### File Format
 
-The configuration may be specified as a JSON or YAML object. There are no requirements on field ordering, though it's generally good style to start a router with the _protocol_. Four top level keys are supported:
+The configuration may be specified as a JSON or YAML object. There are no requirements on field ordering, though it's generally good style to start a router with the _protocol_. Five top level keys are supported:
 
 Key | Required | Description
 --- | -------- | -----------
@@ -83,8 +83,12 @@ Key | Default Value | Description
 --- | ------------- | -----------
 ip | loopback address | IP for the admin interface. A value like 0.0.0.0 configures admin to listen on all local IPv4 interfaces.
 port | `9990` | Port for the admin interface.
+socketOptions | none | Socket options to set for the admin interface.
 httpIdentifierPort | none | Port for the http identifier debug endpoint.
-tls | no tls | The admin interface will serve over TLS if this parameter is provided. see [TLS](#server-tls).
+shutdownGraceMs | 10000 | maximum grace period before the Linkerd process exits
+tls | no tls | The admin interface will serve over TLS if this parameter is provided. See [TLS](#server-tls).
+security | no restrictions | The admin interface can block sensitive endpoints if configured. See [Admin Security](#admin-security)
+workerThreads | 2 | The number of worker threads used to serve the admin interface.
 
 #### Administrative endpoints
 
@@ -141,6 +145,46 @@ This administrative interface was originally based on
 [TwitterServer](https://twitter.github.io/twitter-server), more information may
 be found at
 [TwitterServer HTTP Admin interface](https://twitter.github.io/twitter-server/Admin.html).
+
+#### Admin security
+
+> Example to disable the endpoint `/admin/shutdown` exclusively
+
+```yaml
+admin:
+  ip: 127.0.0.1
+  port: 9990
+  security:
+    pathBlacklist:
+    - ^/admin/shutdown$
+```
+
+By default all administrative endpoints are accessible.
+This might not always be desired as this allows for example everybody to shutdown the process if the administrative port is not closed because metrics should be polled from Linkerd.
+The admin security configuration allows to whitelist or blacklist dedicated administrative endpoints.
+
+```yaml
+admin:
+  ip: 127.0.0.1
+  port: 9990
+  security:
+    uiEnabled: true
+    controlEnabled: false
+    pathWhitelist:
+    - ^/logging[.]json$
+```
+
+The security configuration supports these parameters allowing fine grained control over the administrative endpoints that are available.
+
+Key | Default Value | Description
+--- | ------------- | -----------
+uiEnabled | true | Configures if all endpoints that belong to the category required to run the administrative ui are available
+controlEnabled | true | Configures if the endpoints that belong to the category to control Linkerd are available, i.e. `/admin/shutdown` and `/logging.json`
+diagnosticsEnabled | true | Configures if all other endpoints are available.
+pathWhitelist | empty list | Configures paths via regular expressions that should be available for disabled endpoint categories
+pathBlacklist | empty list | Configures additional paths via regular expressions that should not be available for enabled categories
+
+An administrative endpoint is available if its category is enabled and it is not on the blacklist or if its category is disabled and it is on the whitelist.
 
 ### Routers Intro
 
@@ -227,3 +271,19 @@ Key | Default Value | Description
 --- | ------------- | -----------
 orgId | empty by default | Optional string of your choosing that identifies your organization
 enabled | true | If set to true, data is sent to Buoyant once per hour
+
+### Socket Options
+
+Linkerd supports configuring socket level options for any given interface.
+i.e. the admin and router interfaces. These configurations are only available
+on Linux 3.9 distributions and newer.
+
+Key | Default Value | Description
+--- | ------------- | -----------
+noDelay | true | If set to true, enables the use of `TCP_NODELAY` on a socket interface
+reuseAddr | true | If set to true, enables the `SO_REUSEADDR` option
+reusePort | false | If set to true, enables the `SO_REUSEPORT` option, which can be used to bind another Linkerd process to the same interface port.
+readTimeoutMs | unbounded | Configures this client or server with given transport-level socket read timeout in milliseconds.
+writeTimeoutMs | unbounded | Configures this client or server with given transport-level socket write timeout in milliseconds.
+keepAlive | false | If set to true, enables the `SO_KEEPALIVE` option, which will enable keep alive on the socket.
+backlog | None | If set will adjust the backlog queue size of the socket, a default of None falls back to the OS defined value of SOMAXCONN

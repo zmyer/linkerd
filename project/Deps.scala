@@ -2,33 +2,32 @@ import sbt._
 
 object Deps {
 
-  val curatorFramework = "org.apache.curator" % "curator-framework" % "2.9.1"
-  val curatorClient = "org.apache.curator" % "curator-client" % "2.9.1"
-  val curatorDiscovery = "org.apache.curator" % "curator-x-discovery" % "2.9.1"
+  val curatorFramework = "org.apache.curator" % "curator-framework" % "4.1.0"
+  val curatorClient = "org.apache.curator" % "curator-client" % "4.1.0"
+  val curatorDiscovery = "org.apache.curator" % "curator-x-discovery" % "4.1.0"
 
   // process lifecycle
   val twitterServer =
-    ("com.twitter" %% "twitter-server" % "1.32.0")
+    ("com.twitter" %% "twitter-server" % "18.12.0")
       .exclude("com.twitter", "finagle-zipkin_2.12")
 
   def twitterUtil(mod: String) =
-    "com.twitter" %% s"util-$mod" % "7.1.0"
-
+    "com.twitter" %% s"util-$mod" % "18.12.0"
   // networking
   def finagle(mod: String) =
-    "com.twitter" %% s"finagle-$mod" % "7.1.0"
+    "com.twitter" %% s"finagle-$mod" % "18.12.0"
 
   def netty4(mod: String) =
-    "io.netty" % s"netty-$mod" % "4.1.14.Final"
+    "io.netty" % s"netty-$mod" % "4.1.31.Final"
 
-  val boringssl = "io.netty" % "netty-tcnative-boringssl-static" % "2.0.5.Final"
+  val boringssl = "io.netty" % "netty-tcnative-boringssl-static" % "2.0.19.Final"
 
   def zkCandidate =
     ("com.twitter.common.zookeeper" % "candidate" % "0.0.84")
       .exclude("com.twitter.common", "util")
 
   // Jackson (parsing)
-  val jacksonVersion = "2.8.4"
+  val jacksonVersion = "2.9.6"
   val jacksonCore =
     "com.fasterxml.jackson.core" % "jackson-core" % jacksonVersion
   val jacksonAnnotations =

@@ -6,9 +6,11 @@
 routers:
 - protocol: http
   httpAccessLog: access.log
+  httpAccessLogRollPolicy: daily
+  httpAccessLogAppend: true
+  httpAccessLogRotateCount: -1
   identifier:
     kind: io.l5d.methodAndHost
-  maxChunkKB: 8
   maxHeadersKB: 8
   maxInitialLineKB: 4
   maxRequestKB: 5120
@@ -30,15 +32,18 @@ Key | Default Value | Description
 --- | ------------- | -----------
 dstPrefix | `/svc` | A path prefix used by [Http-specific identifiers](#http-1-1-identifiers).
 httpAccessLog | none | Sets the access log path.  If not specified, no access log is written.
+httpAccessLogRollPolicy | never | When to roll the logfile. Possible values: Never, Hourly, Daily, Weekly(n) (where n is a day of the week), util-style data size strings (e.g. 3.megabytes, 1.gigabyte).
+httpAccessLogAppend | true | Append to an existing logfile, or truncate it?
+httpAccessLogRotateCount | -1 | How many rotated logfiles to keep around, maximum. -1 means to keep them all.
 identifier | The `io.l5d.header.token` identifier | An identifier or list of identifiers.  See [Http-specific identifiers](#http-1-1-identifiers).
-loggers | none | A list of loggers.  See [Http-specific loggers](#http-1-1-loggers).
-maxChunkKB | 8 | The maximum size of an HTTP chunk.
+streamAfterContentLengthKB | 5 | The threshold at which HTTP messages will be streamed if exceeded.
 maxHeadersKB | 8 | The maximum size of all headers in an HTTP message.
 maxInitialLineKB | 4 | The maximum size of an initial HTTP message line.
 maxRequestKB | 5120 | The maximum size of a non-chunked HTTP request payload.
 maxResponseKB | 5120 | The maximum size of a non-chunked HTTP response payload.
 compressionLevel | `-1`, automatically compresses textual content types with compression level 6 | The compression level to use (on 0-9).
 streamingEnabled | `true` | Streaming allows Linkerd to work with HTTP messages that have large (or infinite) content bodies using chunked encoding.  Disabling this is highly discouraged.
+tracePropagator | `io.l5d.default` | A trace propagator.  See [Http-specific trace propagator](#http-1-1-trace-propagators).
 
 <aside class="warning">
 These memory constraints are selected to allow reliable
@@ -388,7 +393,7 @@ svc | N/A | The name of the service.
 
 
 <a href="istio-identifier"></a>
-### Istio Identifier
+### Istio Identifier (Deprecated)
 
 kind: `io.l5d.k8s.istio`
 
@@ -475,31 +480,31 @@ Key | Default Value | Description
 dstPrefix | `/svc` | The `dstPrefix` as set in the routers block.
 path | N/A | The path given in the configuration.
 
-<a name="http-1-1-loggers"></a>
-## HTTP/1.1 Loggers
+<a name="http-1-1-request-authorizers"></a>
+## HTTP/1.1 Request Authorizers
 
-Loggers allow recording of arbitrary information about requests. Destination of
-information is specific to each logger. All HTTP/1.1 loggers have a `kind`. If a
-list of loggers is provided, they each log in the order they are defined.
+Request authorizers allow arbitrary rejection or modification of requests and responses. Behavior is
+specific to each request authorizer.  All HTTP/1.1 request authorizers have a `kind`. If a
+list of request authorizers is provided, they each apply in the order they are defined.
 
 Key | Default Value | Description
 --- | ------------- | -----------
-kind | _required_ | Only [`io.l5d.k8s.istio`](#istio-logger) is currently supported.
+kind | _required_ | Only [`io.l5d.k8s.istio`](#istio-request-authorizer) is currently supported.
 
-<a name="istio-logger"></a>
-### Istio Logger
+<a name="istio-request-authorizer"></a>
+### Istio Request Authorizer (Deprecated)
 
 kind: `io.l5d.k8s.istio`.
 
-With this logger, all HTTP requests are sent to an Istio Mixer for telemetry
+With this request authorizer, all HTTP requests are sent to an Istio Mixer for telemetry
 recording and aggregation.
 
-#### Logger Configuration:
+#### Request Authorizer Configuration:
 
 > Configuration example
 
 ```yaml
-loggers:
+requestAuthorizers:
 - kind: io.l5d.k8s.istio
   mixerHost: istio-mixer
   mixerPort: 9091
@@ -509,6 +514,54 @@ Key | Default Value | Description
 --- | ------------- | -----------
 mixerHost | `istio-mixer` | Hostname of the Istio Mixer server.
 mixerPort | `9091` | Port of the Mixer server.
+
+<a name="http-1-1-trace-propagators"></a>
+## HTTP/1.1 Trace Propagators
+
+Trace propagators are responsible for propagating distributed tracing data from requests that
+Linkerd receives to requests that Linkerd sends.  The trace propagator reads trace context from
+a received request (usually from request headers) and stores it in a request local context.  The
+trace propagator is also responsible for writing this trace context into requests that Linkerd sends
+(usually into request headers).
+
+Key | Default Value | Description
+--- | ------------- | -----------
+kind | _required_ | One of [`io.l5d.default`](#default-trace-propagator), [`io.l5d.zipkin`](#zipkin-trace-propagator).
+
+<a name="default-trace-propagator"></a>
+### Default Trace Propagator
+
+kind: `io.l5d.default`.
+
+The default trace propagator stores the trace id in the `l5d-ctx-trace` request header.  It also
+reads the `l5d-sample` and, if present, uses this value as the sample rate for this request.
+
+<aside class="notice">
+The trace information in the header are serialized by Finagles `TraceId.serialize` method.
+</aside>
+
+<a name="zipkin-trace-propagator"></a>
+### Zipkin Trace Propagator
+
+kind: `io.l5d.zipkin`.
+
+A trace propagator that writes Zipkin B3 trace headers to outgoing requests. Processes B3 Headers 
+received from upstream as well. 
+
+Header | Content
+------ | -------
+`x-b3-traceid` | 128 or 64 lower-hex encoded bits (required)
+`x-b3-spanid` | 64 lower-hex encoded bits (required)
+`x-b3-parentspanid` | 64 lower-hex encoded bits (absent on root span)
+`x-b3-sampled` | Boolean (either “1” or “0”, can be absent)
+`x-b3-flags` | '1' means debug (can be absent)
+
+> Configuration example
+
+```yaml
+tracePropagator:
+  kind: io.l5d.zipkin
+```
 
 <a name="http-headers"></a>
 ## HTTP Headers

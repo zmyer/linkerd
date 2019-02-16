@@ -2,16 +2,14 @@ package io.buoyant.namerd.iface
 
 import com.fasterxml.jackson.annotation.JsonIgnore
 import com.twitter.finagle.stats.StatsReceiver
-import com.twitter.finagle.{Namer, Path, Stack, Thrift, ThriftMux}
+import com.twitter.finagle.{Namer, Path, Stack, ThriftMux}
 import com.twitter.finagle.naming.NameInterpreter
 import com.twitter.finagle.param
-import com.twitter.scrooge.ThriftService
-import com.twitter.util.Duration
-import com.twitter.util.TimeConversions._
 import io.buoyant.namerd.iface.ThriftNamerInterface.LocalStamper
 import io.buoyant.namerd._
 import java.net.{InetAddress, InetSocketAddress}
-import scala.util.Random
+
+import com.twitter.finagle.tracing.NullTracer
 
 case class ThriftInterpreterInterfaceConfig(
   cache: Option[CapacityConfig] = None
@@ -37,7 +35,8 @@ case class ThriftInterpreterInterfaceConfig(
     )
     val params =
       tlsParams +
-        param.Stats(stats1)
+        param.Stats(stats1) ++
+        socketOptParams
     ThriftServable(addr, iface, params)
   }
 }
@@ -52,24 +51,29 @@ class ThriftInterpreterInterfaceInitializer extends InterfaceInitializer {
   val configClass = classOf[ThriftInterpreterInterfaceConfig]
 }
 
-case class ThriftServable(addr: InetSocketAddress, iface: ThriftService, params: Stack.Params) extends Servable {
+case class ThriftServable(addr: InetSocketAddress, iface: AnyRef, params: Stack.Params) extends Servable {
   def kind = ThriftInterpreterInterfaceConfig.kind
   val thriftMux = ThriftMux.server
-  def serve() = thriftMux.withParams(thriftMux.params ++ params).serveIface(addr, iface)
+  def serve() = ThriftMux.server
+    .withTracer(NullTracer).configuredParams(params).serveIface(addr, iface)
 }
 
 case class CapacityConfig(
   bindingCacheActive: Option[Int] = None,
   bindingCacheInactive: Option[Int] = None,
+  bindingCacheInactiveTTLSecs: Option[Int] = None,
   addrCacheActive: Option[Int] = None,
-  addrCacheInactive: Option[Int] = None
+  addrCacheInactive: Option[Int] = None,
+  addrCacheInactiveTTLSecs: Option[Int] = None
 ) {
   private[this] val default = ThriftNamerInterface.Capacity.default
 
   def capacity = ThriftNamerInterface.Capacity(
     bindingCacheActive = bindingCacheActive.getOrElse(default.bindingCacheActive),
     bindingCacheInactive = bindingCacheInactive.getOrElse(default.bindingCacheInactive),
+    bindingCacheInactiveTTLSecs = bindingCacheInactiveTTLSecs.getOrElse(default.bindingCacheInactiveTTLSecs),
     addrCacheActive = addrCacheActive.getOrElse(default.addrCacheActive),
-    addrCacheInactive = addrCacheInactive.getOrElse(default.addrCacheInactive)
+    addrCacheInactive = addrCacheInactive.getOrElse(default.addrCacheInactive),
+    addrCacheInactiveTTLSecs = addrCacheInactiveTTLSecs.getOrElse(default.addrCacheInactiveTTLSecs)
   )
 }

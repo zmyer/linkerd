@@ -1,7 +1,8 @@
 package io.buoyant.telemetry.prometheus
 
 import com.twitter.finagle.http.Request
-import io.buoyant.telemetry.{Metric, MetricsTree, MetricsTreeStatsReceiver}
+import com.twitter.finagle.stats.buoyant.Metric
+import io.buoyant.telemetry.{MetricsTree, MetricsTreeStatsReceiver}
 import io.buoyant.test.FunSuite
 
 class PrometheusTelemeterTest extends FunSuite {
@@ -87,6 +88,22 @@ class PrometheusTelemeterTest extends FunSuite {
                      |""".stripMargin)
   }
 
+  test("empty histograms are not printed") {
+    val (stats, handler) = statsAndHandler
+    val stat = stats.scope("foo", "bar").stat("bas")
+    val metricsTreeStat =
+      stats.tree.resolve(Seq("foo", "bar", "bas")).metric.asInstanceOf[Metric.Stat]
+
+    // endpoint should return no data before first snapshot
+    val rsp0 = await(handler(Request(prometheusPath))).contentString
+    assert(rsp0 == "")
+
+    metricsTreeStat.snapshot()
+
+    val rsp1 = await(handler(Request(prometheusPath))).contentString
+    assert(rsp1 == "")
+  }
+
   test("metric labels are escaped") {
     val (stats, handler) = statsAndHandler
     val counter = stats.scope("rt", "incoming", "service", """\x5b\x31\x32\x33\x2e\x31\x32\x33\x2e\x31\x32\x33\x2e\x31\x32\x33\x5dun"esc""").counter("requests")
@@ -126,5 +143,81 @@ class PrometheusTelemeterTest extends FunSuite {
     counter.incr()
     val rsp = await(handler(Request(prometheusPath))).contentString
     assert(rsp == "linkerd_rt:server:requests{rt=\"incoming\", server=\"127.0.0.1/4141\"} 1\n")
+  }
+
+  test("exception stats are labelled for service") {
+    val (stats, handler) = statsAndHandler
+    // Replicate stack trace for some failure bar:baz
+    stats.scope("rt", "incoming", "service", "/#/foo", "failures").counter("bar").incr()
+    stats.scope("rt", "incoming", "service", "/#/foo", "failures").counter("bar:baz").incr()
+
+    // Replicate stack trace for some failure bar:qux
+    stats.scope("rt", "incoming", "service", "/#/foo", "failures").counter("bar").incr()
+    stats.scope("rt", "incoming", "service", "/#/foo", "failures").counter("bar", "qux").incr()
+
+    // Replicate stack trace for some some exception thud
+    stats.scope("rt", "incoming", "service", "/#/foo", "exn").counter("thud").incr()
+
+    val rsp = await(handler(Request(prometheusPath))).contentString
+    assert(rsp == """linkerd_rt:service:failures{rt="incoming", service="/#/foo", exception="bar"} 2
+                    |linkerd_rt:service:failures{rt="incoming", service="/#/foo", exception="bar:qux"} 1
+                    |linkerd_rt:service:failures{rt="incoming", service="/#/foo", exception="bar:baz"} 1
+                    |linkerd_rt:service:exceptions{rt="incoming", service="/#/foo", exception="thud"} 1
+                    |""".stripMargin)
+  }
+
+  test("exception stats are labelled for client") {
+    val (stats, handler) = statsAndHandler
+    // Replicate stack trace for some failure bar:baz
+    stats.scope("rt", "incoming", "client", "/#/foo", "failures").counter("bar").incr()
+    stats.scope("rt", "incoming", "client", "/#/foo", "failures").counter("bar:baz").incr()
+
+    // Replicate stack trace for some failure bar:qux
+    stats.scope("rt", "incoming", "client", "/#/foo", "failures").counter("bar").incr()
+    stats.scope("rt", "incoming", "client", "/#/foo", "failures").counter("bar", "qux").incr()
+
+    // Replicate stack trace for some some exception thud
+    stats.scope("rt", "incoming", "client", "/#/foo", "exn").counter("thud").incr()
+
+    val rsp = await(handler(Request(prometheusPath))).contentString
+    assert(rsp == """linkerd_rt:client:failures{rt="incoming", client="/#/foo", exception="bar"} 2
+                    |linkerd_rt:client:failures{rt="incoming", client="/#/foo", exception="bar:qux"} 1
+                    |linkerd_rt:client:failures{rt="incoming", client="/#/foo", exception="bar:baz"} 1
+                    |linkerd_rt:client:exceptions{rt="incoming", client="/#/foo", exception="thud"} 1
+                    |""".stripMargin)
+  }
+
+  test("exception stats are labelled for server") {
+    val (stats, handler) = statsAndHandler
+    // Replicate stack trace for some failure foo:bar
+    stats.scope("rt", "incoming", "server", "127.0.0.1/4141", "failures").counter("foo").incr()
+    stats.scope("rt", "incoming", "server", "127.0.0.1/4141", "failures").counter("foo:bar").incr()
+
+    // Replicate stack trace for some failure foo:baz
+    stats.scope("rt", "incoming", "server", "127.0.0.1/4141", "failures").counter("foo").incr()
+    stats.scope("rt", "incoming", "server", "127.0.0.1/4141", "failures").counter("foo", "baz").incr()
+
+    // Replicate stack trace for some some exception qux
+    stats.scope("rt", "incoming", "server", "127.0.0.1/4141", "exn").counter("qux").incr()
+
+
+    val rsp = await(handler(Request(prometheusPath))).contentString
+    assert(rsp == """linkerd_rt:server:failures{rt="incoming", server="127.0.0.1/4141", exception="foo:bar"} 1
+                    |linkerd_rt:server:failures{rt="incoming", server="127.0.0.1/4141", exception="foo"} 2
+                    |linkerd_rt:server:failures{rt="incoming", server="127.0.0.1/4141", exception="foo:baz"} 1
+                    |linkerd_rt:server:exceptions{rt="incoming", server="127.0.0.1/4141", exception="qux"} 1
+                    |""".stripMargin)
+  }
+
+  test("exception stats do not match for all stack values") {
+    val (stats, handler) = statsAndHandler
+
+    stats.scope("rt", "foo", "non_stack_match", "bar", "additional_path").counter("qux").incr()
+    stats.scope("rt", "foo", "non_stack_match", "bar", "exception").counter("quux").incr()
+
+    val rsp = await(handler(Request(prometheusPath))).contentString
+    assert(rsp == """linkerd_rt:non_stack_match:bar:exception:quux{rt="foo"} 1
+                    |linkerd_rt:non_stack_match:bar:additional_path:qux{rt="foo"} 1
+                    |""".stripMargin)
   }
 }

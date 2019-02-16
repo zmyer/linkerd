@@ -1,9 +1,8 @@
 package io.buoyant.telemetry.influxdb
 
-import com.twitter.conversions.time._
 import com.twitter.finagle.http.Request
-import com.twitter.util.{MockTimer, Time}
-import io.buoyant.telemetry.{Metric, MetricsTree, MetricsTreeStatsReceiver}
+import com.twitter.finagle.stats.buoyant.Metric
+import io.buoyant.telemetry.{MetricsTree, MetricsTreeStatsReceiver}
 import io.buoyant.test.FunSuite
 
 class InfluxDbTelemeterTest extends FunSuite {

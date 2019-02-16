@@ -1,6 +1,7 @@
 package io.buoyant.linkerd
 
 import com.twitter.finagle.Path
+import com.twitter.logging.{Level, Logger}
 import com.twitter.util._
 import io.buoyant.admin.{App, Build}
 import io.buoyant.linkerd.admin.LinkerdAdmin
@@ -19,23 +20,37 @@ import sun.misc.{Signal, SignalHandler}
  */
 object Main extends App {
 
+  /**
+   * Flag to validate a configuration.
+   */
+  private val validate = flag.apply("validate", false, "Only validate a configuration and finish with a proper status code")
+
   private[this] val DefaultShutdownGrace =
     Duration.fromSeconds(10)
+
+  private[this] var shutdownGracePeriod: Option[Int] = null
 
   def main() {
     val build = Build.load("/io/buoyant/linkerd/build.properties")
     log.info("linkerd %s (rev=%s) built at %s", build.version, build.revision, build.name)
 
+    // twitter/finagle#739 -- Linkerd logs incorrect message about Content-Length for HTTP 204 responses
+    Logger.get("com.twitter.finagle.http.codec.ResponseConformanceFilter$").setLevel(Level.OFF)
+
     args match {
       case Array(path) =>
         val config = loadLinker(path)
+        shutdownGracePeriod = config.admin.flatMap(_.shutdownGraceMs)
+        if (validate())
+          return
+
         val linker = config.mk()
         val admin = initAdmin(config, linker)
         val telemeters = linker.telemeters.map(_.run())
         val routers = linker.routers.map(initRouter(_))
 
         log.info("initialized")
-        registerTerminationSignalHandler(config.admin.flatMap(_.shutdownGraceMs))
+        registerTerminationSignalHandler(shutdownGracePeriod)
         closeOnExit(Closable.sequence(
           Closable.all(routers: _*),
           Closable.all(telemeters: _*),
@@ -61,7 +76,7 @@ object Main extends App {
     Linker.parse(configText)
   }
 
-  private def initAdmin(
+  private[linkerd] def initAdmin(
     config: Linker.LinkerConfig,
     linker: Linker
   ): Seq[Closable with Awaitable[Unit]] = {
@@ -153,4 +168,8 @@ object Main extends App {
     val _ = Signal.handle(new Signal("TERM"), shutdownHandler)
   }
 
+  override def defaultCloseGracePeriod: Duration =
+    shutdownGracePeriod
+      .map(Duration.fromMilliseconds(_))
+      .getOrElse(DefaultShutdownGrace)
 }

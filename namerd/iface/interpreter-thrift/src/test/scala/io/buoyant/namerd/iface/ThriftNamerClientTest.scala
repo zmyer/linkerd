@@ -1,6 +1,6 @@
 package io.buoyant.namerd.iface
 
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle._
 import com.twitter.util._
 import io.buoyant.namer.{DelegateTree, Metadata}
@@ -18,7 +18,7 @@ class ThriftNamerClientTest extends FunSuite with Awaits {
     var count = 1
   }
 
-  class TestNamerService(clientId: Path) extends thrift.Namer.FutureIface {
+  class TestNamerService(clientId: Path) extends thrift.Namer.MethodPerEndpoint {
     val bindingsMu = new {}
     var bindings = Map.empty[(String, Path, Dtab, TStamp), Rsp[thrift.Bound]]
 
@@ -80,8 +80,7 @@ class ThriftNamerClientTest extends FunSuite with Awaits {
     val service = new TestNamerService(clientId)
     val client = new ThriftNamerClient(service, namespace, Stream.continually(Duration.Zero), clientId = clientId)
 
-    val act = client.delegate(Dtab.empty, Path.read("/yeezy/tlop/wolves"))
-    val delegation = act.toFuture
+    val delegation = client.delegate(Dtab.empty, Path.read("/yeezy/tlop/wolves"))
     assert(!delegation.isDefined)
 
     val tree = DelegateTree.Delegate(Path.read("/yeezus/tlop/wolves"), Dentry.read("/yeezy => /yeezus"), DelegateTree.Neg(Path.read("/yeezus/tlop/wolves"), Dentry.nop))

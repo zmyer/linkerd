@@ -1,21 +1,23 @@
 package io.buoyant.router
 package h2
 
+import java.net.InetSocketAddress
 import com.twitter.concurrent.AsyncQueue
-import com.twitter.finagle.{ChannelClosedException, Dtab, Failure, Path}
 import com.twitter.finagle.buoyant.Dst
 import com.twitter.finagle.buoyant.h2._
+import com.twitter.finagle.{Status => _, _}
 import com.twitter.logging.Level
 import com.twitter.util.{Future, Promise, Throw}
 import io.buoyant.router.h2.ClassifiedRetries.BufferSize
-import io.buoyant.test.FunSuite
-import java.net.InetSocketAddress
+import io.buoyant.test.{BudgetedRetries, FunSuite}
+import org.scalatest.tagobjects.Retryable
 
 class RouterEndToEndTest
   extends FunSuite
-  with ClientServerHelpers {
+  with ClientServerHelpers
+  with BudgetedRetries {
 
-  test("simple prior knowledge") {
+  test("simple prior knowledge", Retryable) {
     val cat = Downstream.const("cat", "meow")
     val dog = Downstream.const("dog", "woof")
     val dtab = Dtab.read(s"""
@@ -47,7 +49,7 @@ class RouterEndToEndTest
     }
   }
 
-  test("fails requests with connection-headers") {
+  test("fails requests with connection-headers", Retryable) {
     val dog = Downstream.const("dog", "woof")
     val dtab = Dtab.read(s"""
         /p/dog => /$$/inet/127.1/${dog.port} ;
@@ -64,7 +66,7 @@ class RouterEndToEndTest
     try {
       val req = Request("http", Method.Get, "clifford", "/path", Stream.empty())
       req.headers.set("connection", "close")
-      assert(await(client(req).liftToTry) == Throw(StreamError.Local(Reset.ProtocolError)))
+      assert(await(client(req).liftToTry) == Throw(Reset.ProtocolError))
     } finally {
       setLogLevel(Level.OFF)
       await(client.close())
@@ -73,7 +75,7 @@ class RouterEndToEndTest
     }
   }
 
-  test("resets downstream on upstream cancelation") {
+  test("resets downstream on upstream cancelation", Retryable) {
     val dogReqP = new Promise[Stream]
     val dogRspP = new Promise[Stream]
     @volatile var serverInterrupted: Option[Throwable] = None
@@ -104,7 +106,7 @@ class RouterEndToEndTest
       val reqStream = await(dogReqP)
       assert(!rspF.isDefined)
 
-      rspF.raise(Failure("failz", Failure.Interrupted))
+      rspF.raise(Failure("failz", FailureFlags.Interrupted))
       assert(await(rspF.liftToTry) == Throw(Reset.Cancel))
       eventually(assert(serverInterrupted == Some(Reset.Cancel)))
 
@@ -116,7 +118,7 @@ class RouterEndToEndTest
     }
   }
 
-  test("resets downstream on upstream disconnect") {
+  test("resets downstream on upstream disconnect", Retryable) {
     val dogReqP = new Promise[Stream]
     val dogRspP = new Promise[Stream]
     val dog = Downstream.service("dog") { req =>
@@ -155,7 +157,7 @@ class RouterEndToEndTest
       val rspReadF = rsp.stream.read()
 
       clientLocalQ.fail(new ChannelClosedException())
-      assert(await(reqReadF.liftToTry) == Throw(Reset.Cancel))
+      assert(await(reqReadF.liftToTry) == Throw(Reset.InternalError))
 
     } finally {
       setLogLevel(Level.OFF)
@@ -164,7 +166,7 @@ class RouterEndToEndTest
     }
   }
 
-  test("resets upstream on downstream failure") {
+  test("resets upstream on downstream failure", Retryable) {
     val dogReqP = new Promise[Stream]
     val dogRspP = new Promise[Stream]
     val dog = Downstream.service("dog") { req =>
@@ -193,7 +195,7 @@ class RouterEndToEndTest
       val _ = await(dogReqP)
       assert(!rspF.isDefined)
 
-      dogRspP.setException(Failure("failz", Failure.Rejected))
+      dogRspP.setException(Failure("failz", FailureFlags.Rejected))
       assert(await(rspF.liftToTry) == Throw(Reset.Refused))
 
     } finally {
@@ -203,5 +205,4 @@ class RouterEndToEndTest
       await(router.close())
     }
   }
-
 }

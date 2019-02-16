@@ -2,11 +2,13 @@ package io.buoyant.namer.consul
 
 import com.twitter.finagle._
 import com.twitter.finagle.stats.StatsReceiver
+import com.twitter.finagle.util.DefaultTimer
+import com.twitter.logging.Level
 import com.twitter.util._
 import io.buoyant.consul.v1
-import io.buoyant.namer.Metadata
-import java.net.InetSocketAddress
-
+import io.buoyant.consul.v1.UnexpectedResponse
+import io.buoyant.namer.{InstrumentedVar, Metadata}
+import java.net.{InetAddress, InetSocketAddress}
 import scala.util.control.NoStackTrace
 
 private[consul] case class SvcKey(name: String, tag: Option[String]) {
@@ -21,6 +23,8 @@ private[consul] object SvcAddr {
   private[this] val ServiceRelease =
     new Exception("service observation released") with NoStackTrace
 
+  private[this] val DatacenterErrorMessage = "No path to datacenter"
+
   case class Stats(stats: StatsReceiver) {
     val opens = stats.counter("opens")
     val closes = stats.counter("closes")
@@ -34,38 +38,41 @@ private[consul] object SvcAddr {
    */
   def apply(
     consulApi: v1.ConsulApi,
+    apiBackoffs: Stream[Duration],
     datacenter: String,
     key: SvcKey,
     domain: Option[String],
     consistency: Option[v1.ConsistencyMode] = None,
     preferServiceAddress: Option[Boolean] = None,
     tagWeights: Map[String, Double] = Map.empty,
-    stats: Stats
-  ): Var[Addr] = {
+    stats: Stats,
+    stateWatch: v1.PollState[String, v1.IndexedServiceNodes]
+  )(implicit timer: Timer = DefaultTimer): InstrumentedVar[Addr] = {
     val meta = mkMeta(key, datacenter, domain)
-    def getAddresses(index: Option[String]): Future[v1.Indexed[Set[Address]]] =
-      consulApi.serviceNodes(
+    def getAddresses(index: Option[String]): Future[v1.Indexed[Set[Address]]] = {
+      val apiCall = consulApi.serviceNodes(
         key.name,
         datacenter = Some(datacenter),
         tag = key.tag,
         blockingIndex = index,
         consistency = consistency,
-        retry = true
-      ).map(indexedToAddresses(preferServiceAddress, tagWeights))
+        retry = false
+      )
+      v1.InstrumentedApiCall.execute(apiCall, stateWatch)
+        .map(indexedToAddresses(preferServiceAddress, tagWeights))
+    }
 
     // Start by fetching the service immediately, and then long-poll
     // for service updates.
-    Var.async[Addr](Addr.Pending) { state =>
+    InstrumentedVar[Addr](Addr.Pending) { state =>
       stats.opens.incr()
-      // last good state - if an error occurs, fall back to this if
-      // a good state was seen.
-      @volatile var lastGood: Option[Addr] = None
+
       @volatile var stopped: Boolean = false
-      def loop(index0: Option[String]): Future[Unit] = {
+      def loop(blockingIndex: Option[String], backoffs: Stream[Duration], failureLogLevel: Level, currentState: Addr): Future[Unit] = {
 
         if (stopped) Future.Unit
-        else getAddresses(index0).transform {
-          case Throw(Failure(Some(cause))) if cause == ServiceRelease =>
+        else getAddresses(blockingIndex).transform {
+          case Throw(RootCause(cause)) if cause == ServiceRelease =>
             // this exception is raised when we close a watch - thus, it needs
             // to be special-cased so that we don't continue observing that
             // service.
@@ -76,45 +83,29 @@ private[consul] object SvcAddr {
             )
             stopped = true
             Future.Unit
-          case Throw(Failure(Some(err: ConnectionFailedException))) =>
-            log.warning(
-              "consul datacenter '%s' service '%s' retrying on connection" +
-                " failure: %s",
-              datacenter, key.name, err
-            )
-            // Drop the index, in case it's been reset by a consul restart
-            loop(None)
           case Throw(e) =>
-            // an error occurred. if we've previously seen a good state, fall
-            // back to that state; otherwise, fail.
+            // Update state only if it is state Pending to not let linkerd hang on name resolution
+            // Otherwise retain last known state to allow namerd survive intermittent failures
             stats.errors.incr()
-            lastGood match {
-              case Some(addr) =>
-                // if we've already seen a good state, fall back to that and
-                // try again.
-                state() = addr
-                log.warning(
-                  "consul datacenter '%s' service '%s' observation error %s," +
-                    " falling back to last good state",
-                  datacenter, key.name, e
-                )
-                loop(index0)
-              case None =>
-                // if no previous good state was seen, treat the exception
-                // as effectively fatal to the service observation.
-                state() = Addr.Failed(e)
-                log.error(
-                  "consul datacenter '%s' service '%s' observation error %s," +
-                    " no previous good state to fall back to!",
-                  datacenter, key.name, e
-                )
-                Future.exception(e)
+            val effectiveState = if (currentState == Addr.Pending) {
+              state.update(Addr.Neg)
+              Addr.Neg
+            } else {
+              currentState
             }
 
+            log.log(
+              failureLogLevel,
+              "consul datacenter '%s' service '%s' observation error %s. Current state is %s",
+              datacenter, key.name, e, effectiveState
+            )
+            val backoff #:: nextBackoffs = backoffs
+            // subsequent errors are logged as DEBUG
+            Future.sleep(backoff).before(loop(None, nextBackoffs, Level.DEBUG, effectiveState))
           case Return(v1.Indexed(_, None)) =>
             // If consul doesn't return an index, we're in bad shape.
             // TODO: do we want to revert to the last good state here, as well?
-            state() = Addr.Failed(NoIndexException)
+            state.update(Addr.Failed(NoIndexException))
             stats.errors.incr()
             log.error(
               "consul datacenter '%s' service '%s' didn't return an index!",
@@ -122,28 +113,29 @@ private[consul] object SvcAddr {
             )
             Future.exception(NoIndexException)
 
-          case Return(v1.Indexed(addrs, index1)) =>
+          case Return(v1.Indexed(addrs, xConsulIndex)) =>
             stats.updates.incr()
             val addr = addrs match {
               case addrs if addrs.isEmpty => Addr.Neg
               case addrs => Addr.Bound(addrs, meta)
             }
-            lastGood = Some(addr)
-            state() = addr
+            state.update(addr)
 
-            loop(index1)
+            loop(xConsulIndex, apiBackoffs, Level.WARNING, addr)
         }
       }
 
-      val pending = loop(None)
+      val pending = loop(None, apiBackoffs, Level.WARNING, Addr.Pending)
       Closable.make { _ =>
         stopped = true
         stats.closes.incr()
-        pending.raise(Failure("service observation released", ServiceRelease, Failure.Interrupted))
-        Future.Unit
+        pending.raise(Failure(ServiceRelease.getMessage, ServiceRelease, FailureFlags.Interrupted))
+        pending
       }
     }
   }
+
+  def mkConsulPollState: v1.PollState[String, v1.Indexed[Seq[v1.ServiceNode]]] = new v1.PollState
 
   private[this] def mkMeta(key: SvcKey, dc: String, domain: Option[String]) =
     domain match {
@@ -156,7 +148,7 @@ private[consul] object SvcAddr {
         Addr.Metadata(Metadata.authority -> authority)
     }
 
-  private[this] def indexedToAddresses(preferServiceAddress: Option[Boolean], tagWeights: Map[String, Double]): v1.Indexed[Seq[v1.ServiceNode]] => v1.Indexed[Set[Address]] = {
+  private[this] def indexedToAddresses(preferServiceAddress: Option[Boolean], tagWeights: Map[String, Double]): v1.IndexedServiceNodes => v1.Indexed[Set[Address]] = {
     case v1.Indexed(nodes, idx) =>
       val addrs = preferServiceAddress match {
         case Some(false) => nodes.flatMap(serviceNodeToNodeAddr(_, tagWeights)).toSet
@@ -194,9 +186,16 @@ private[consul] object SvcAddr {
       case Some(ws) => ws.max
     }
     val meta = Addr.Metadata((Metadata.endpointWeight, weight))
-    Try(Address.Inet(new InetSocketAddress(ip, port), meta)).toOption
+    Try(InetAddress.getAllByName(ip)
+      .toTraversable
+      .map(singleIP => Address.Inet(new InetSocketAddress(singleIP, port), meta)))
+      .getOrElse(Seq())
   }
 
   private[this] val NoIndexException =
     Failure(new IllegalArgumentException("consul did not return an index") with NoStackTrace)
+
+  object RootCause {
+    def unapply(e: Throwable): Option[Throwable] = Option(e.getCause).flatMap(unapply).orElse(Some(e))
+  }
 }

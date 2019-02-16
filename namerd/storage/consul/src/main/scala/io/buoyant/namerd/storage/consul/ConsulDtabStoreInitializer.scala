@@ -8,8 +8,9 @@ import io.buoyant.config.types.Port
 import io.buoyant.consul.utils.RichConsulClient
 import io.buoyant.consul.v1.{ConsistencyMode, KvApi}
 import io.buoyant.namer.BackoffConfig
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.Stack
+import com.twitter.finagle.buoyant.TlsClientConfig
 import io.buoyant.namerd.{DtabStore, DtabStoreConfig, DtabStoreInitializer}
 
 case class ConsulConfig(
@@ -21,15 +22,20 @@ case class ConsulConfig(
   readConsistencyMode: Option[ConsistencyMode] = None,
   writeConsistencyMode: Option[ConsistencyMode] = None,
   failFast: Option[Boolean] = None,
-  backoff: Option[BackoffConfig] = None
+  backoff: Option[BackoffConfig] = None,
+  tls: Option[TlsClientConfig] = None
 ) extends DtabStoreConfig {
   import ConsulConfig._
+
+  @JsonIgnore
+  private[this] val root = pathPrefix.getOrElse(Path.read("/namerd/dtabs"))
 
   @JsonIgnore
   override def mkDtabStore(params: Stack.Params): DtabStore = {
     val serviceHost = host.getOrElse(DefaultHost)
     val servicePort = port.getOrElse(DefaultPort).port
     val backoffs = backoff.map(_.mk).getOrElse(DefaultBackoff)
+    val tlsParams = tls.map(_.params).getOrElse(Stack.Params.empty)
 
     val service = Http.client
       .interceptInterrupts
@@ -37,13 +43,15 @@ case class ConsulConfig(
       .setAuthToken(token)
       .ensureHost(host, port)
       .withTracer(NullTracer)
+      .withParams(tlsParams)
       .newService(s"/$$/inet/$serviceHost/$servicePort")
     new ConsulDtabStore(
       KvApi(service, backoffs),
-      pathPrefix.getOrElse(Path.read("/namerd/dtabs")),
+      root,
       datacenter = datacenter,
       readConsistency = readConsistencyMode,
-      writeConsistency = writeConsistencyMode
+      writeConsistency = writeConsistencyMode,
+      handlerUrl = s"storage/${root.show.drop(1)}.json"
     )
   }
 }

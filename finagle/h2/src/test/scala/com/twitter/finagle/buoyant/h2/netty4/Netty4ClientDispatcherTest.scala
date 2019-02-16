@@ -3,14 +3,14 @@ package netty4
 
 import com.twitter.concurrent.AsyncQueue
 import com.twitter.finagle.{Status => SvcStatus}
-import com.twitter.finagle.netty4.BufAsByteBuf
 import com.twitter.finagle.stats.InMemoryStatsReceiver
-import com.twitter.finagle.transport.{LegacyContext, Transport, TransportContext}
-import com.twitter.io.Buf
+import com.twitter.finagle.transport.{SimpleTransportContext, Transport, TransportContext}
 import com.twitter.util.{Future, Promise, Time}
 import io.buoyant.test.FunSuite
+import io.netty.buffer.Unpooled
 import io.netty.handler.codec.http2._
 import java.net.SocketAddress
+import java.nio.charset.StandardCharsets
 
 class Netty4ClientDispatcherTest extends FunSuite {
   setLogLevel(com.twitter.logging.Level.OFF)
@@ -20,7 +20,7 @@ class Netty4ClientDispatcherTest extends FunSuite {
     val closeP = new Promise[Throwable]
     val transport = new Transport[Http2Frame, Http2Frame] {
       type Context = TransportContext
-      def context: Context = new LegacyContext(this)
+      def context: Context = new SimpleTransportContext()
       def status = ???
       def localAddress = new SocketAddress {}
       def remoteAddress = new SocketAddress {}
@@ -60,6 +60,8 @@ class Netty4ClientDispatcherTest extends FunSuite {
         override val isEmpty = false
         override def onEnd = req0EndP
         override def read() = req0q.poll()
+        override def cancel(reset: Reset): Unit = ???
+        override def onCancel: Future[Reset] = Future.never
       }
       Netty4Message.Request(hs, stream)
     }
@@ -83,7 +85,7 @@ class Netty4ClientDispatcherTest extends FunSuite {
     await(req0InitF) match {
       case hf: Http2HeadersFrame =>
         assert(hf.headers.method == "sup")
-        assert(hf.streamId == 3)
+        assert(hf.stream.id == 3)
       case f =>
         fail(s"unexpected frame: $f")
     }
@@ -94,21 +96,22 @@ class Netty4ClientDispatcherTest extends FunSuite {
     await(req1InitF) match {
       case hf: Http2HeadersFrame =>
         assert(hf.headers.method == "sup")
-        assert(hf.streamId == 5)
+        assert(hf.stream.id == 5)
       case f =>
         fail(s"unexpected frame: $f")
     }
 
     assert(req0q.offer({
-      val buf = Buf.Utf8("how's it goin?")
-      Frame.Data(buf, false, () => releaser(buf.length))
+      val buf = Unpooled.copiedBuffer("how's it goin?", StandardCharsets.UTF_8)
+      val sz = buf.readableBytes()
+      Frame.Data(buf, false, () => releaser(sz))
     }))
 
     // We receive a response for req1 first:
     assert(recvq.offer({
       val hs = new DefaultHttp2Headers
       hs.status("222")
-      new DefaultHttp2HeadersFrame(hs, false).streamId(5)
+      new DefaultHttp2HeadersFrame(hs, false).stream(H2FrameStream(5, Http2Stream.State.OPEN))
     }))
 
     assert(rsp0f.poll == None)
@@ -120,7 +123,7 @@ class Netty4ClientDispatcherTest extends FunSuite {
     assert(recvq.offer({
       val hs = new DefaultHttp2Headers
       hs.status("222")
-      new DefaultHttp2HeadersFrame(hs, false).streamId(3)
+      new DefaultHttp2HeadersFrame(hs, false).stream(H2FrameStream(3, Http2Stream.State.OPEN))
     }))
     assert(rsp0f.isDefined)
     val rsp0 = await(rsp0f)
@@ -128,12 +131,14 @@ class Netty4ClientDispatcherTest extends FunSuite {
     assert(rsp0.stream.nonEmpty)
 
     assert(recvq.offer({
-      val buf = Buf.Utf8("sup")
-      new DefaultHttp2DataFrame(BufAsByteBuf(buf), true).streamId(3)
+      val buf = Unpooled.copiedBuffer("sup", StandardCharsets.UTF_8)
+      val dataFrame = new DefaultHttp2DataFrame(buf, true)
+      dataFrame.stream(H2FrameStream(3, Http2Stream.State.OPEN))
     }))
     assert(recvq.offer({
-      val buf = Buf.Utf8("yo")
-      new DefaultHttp2DataFrame(BufAsByteBuf(buf), true).streamId(5)
+      val buf = Unpooled.copiedBuffer("yo", StandardCharsets.UTF_8)
+      val headersFrame = new DefaultHttp2DataFrame(buf, true)
+      headersFrame.stream(H2FrameStream(5, Http2Stream.State.OPEN))
     }))
 
     val d0f = rsp0.stream.read()
@@ -144,7 +149,7 @@ class Netty4ClientDispatcherTest extends FunSuite {
 
     await(d0f) match {
       case f: Frame.Data =>
-        assert(f.buf == Buf.Utf8("sup"))
+        assert(f.buf.toString(StandardCharsets.UTF_8) == "sup")
         assert(f.isEnd)
         await(f.release())
       case f =>
@@ -154,7 +159,7 @@ class Netty4ClientDispatcherTest extends FunSuite {
 
     await(d1f) match {
       case f: Frame.Data =>
-        assert(f.buf == Buf.Utf8("yo"))
+        assert(f.buf.toString(StandardCharsets.UTF_8) == "yo")
         assert(f.isEnd)
         await(f.release())
       case f =>

@@ -1,5 +1,6 @@
 package io.buoyant.namerd.storage.consul
 
+import com.twitter.finagle.buoyant.{ClientAuth, TlsClientConfig}
 import com.twitter.finagle.{Path, Stack}
 import io.buoyant.config.Parser
 import io.buoyant.config.types.Port
@@ -23,6 +24,13 @@ class ConsulConfigTest extends FunSuite with OptionValues {
          |datacenter: us-east-42
          |readConsistencyMode: stale
          |writeConsistencyMode: consistent
+         |tls:
+         |  disableValidation: false
+         |  commonName: consul.io
+         |  trustCertsBundle: /certificates/cacert-bundle.pem
+         |  clientAuth:
+         |    certPath: /certificates/cert.pem
+         |    keyPath: /certificates/key.pem
       """.stripMargin
     val mapper = Parser.objectMapper(yaml, Iterable(Seq(ConsulDtabStoreInitializer)))
     val consul = mapper.readValue[DtabStoreConfig](yaml).asInstanceOf[ConsulConfig]
@@ -33,6 +41,9 @@ class ConsulConfigTest extends FunSuite with OptionValues {
     assert(consul.datacenter == Some("us-east-42"))
     assert(consul.readConsistencyMode == Some(ConsistencyMode.Stale))
     assert(consul.writeConsistencyMode == Some(ConsistencyMode.Consistent))
+    val clientAuth = ClientAuth("/certificates/cert.pem", None, "/certificates/key.pem")
+    val tlsConfig = TlsClientConfig(None, Some(false), Some("consul.io"), None, Some("/certificates/cacert-bundle.pem"), Some(clientAuth))
+    assert(consul.tls == Some(tlsConfig))
   }
 
 }

@@ -1,6 +1,6 @@
 package io.buoyant.router.h2
 
-import com.twitter.conversions.time._
+import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.buoyant.h2.{Request, Response, param => h2Param}
 import com.twitter.finagle.service.Retries
 import com.twitter.finagle.{ServiceFactory, Stack, Stackable, param}
@@ -55,7 +55,7 @@ object ClassifiedRetries {
           params[BufferSize].requestBufferSize,
           params[BufferSize].responseBufferSize
         )(params[param.HighResTimer].timer)
-        Stack.Leaf(role, filter.andThen(next.make(params)))
+        Stack.leaf(role, filter.andThen(next.make(params)))
       }
     }
   }
